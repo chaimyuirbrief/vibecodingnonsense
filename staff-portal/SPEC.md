@@ -376,16 +376,18 @@ to the internet" switch is on (§8.8), which never applies in `lockdown`.
 | Mode | Trusted, or open | Holds a valid invitation link | Anyone else |
 |---|---|---|---|
 | `public` | everything | everything | the sign-in page (still fingerprinted and logged) |
-| `fingerprint_gate` | everything | as anyone else, until the browser has reported a fingerprint | the sign-in page, which must report a browser fingerprint scoring under the risk threshold before a password is accepted; after that, everything |
+| `fingerprint_gate` | trusted: everything (the open switch lifts the *network* rule, not the fingerprint requirement) | as anyone else, until the browser has reported a fingerprint | the sign-in page, which must report a browser fingerprint scoring under the risk threshold before a password is accepted; after that, everything |
 | `request_access` | everything | the invitation page | a request-access form (§6.8) |
 | `allowlist` *(default)* | everything | the invitation page | nothing |
-| `invite_only` | everything | the invitation page | nothing |
+| `invite_only` | an **approved device** (an allowlisted address alone is not enough), or open: everything | the invitation page | an allowlisted address: the device-approval page only; anywhere else: nothing |
 | `lockdown` | an allowlisted address **and** an approved device, and only a Super Admin can sign in | nothing | nothing |
 
-Two notes on the table. `allowlist` and `invite_only` decide identically at the
-gate today; the names record different intents (an office network, against a
-remote team that only ever arrives by link) and leave room for them to
-diverge. And `lockdown` is enforced twice: at the gate, and again when a
+Two notes on the table. `allowlist` trusts the network; `invite_only` does
+not. Under `invite_only` you are in because you were invited (accepting an
+invitation approves the device you accepted it on) or because a device was
+approved for you — an unknown laptop on the office network can queue for
+approval and read its code to an administrator, but never sees the sign-in
+page. And `lockdown` is enforced twice: at the gate, and again when a
 session is loaded, so a non-Super-Admin session that was open when lockdown
 began stops working on its next request.
 
@@ -409,9 +411,9 @@ leave one out and the page silently fails to load it.
 |---|---|---|---|
 | `setup` | no accounts exist | `/`, `/setup` | setup status, `POST /api/setup` |
 | `request` | `request_access`, untrusted | `/`, `/request-access` | `POST /api/access-request`, `POST /api/fp` |
-| `login` | `fingerprint_gate`, no valid fingerprint yet | `/`, `/login` | `POST /api/fp`, `GET /api/auth/whoami` |
+| `login` | `fingerprint_gate`, no valid fingerprint yet | `/`, `/login` | `POST /api/fp`, `GET /api/auth/whoami`, and the sign-in POSTs — the login API itself answers `403 { fingerprint_required }` until a fingerprint is on file |
 | `invite` | a valid invitation pass cookie | `/invite` | invitation lookup and accept, `POST /api/fp` |
-| `pending` | device gating, unapproved device | any navigation shows `/pending` | device status, `GET /api/diag` |
+| `pending` | device gating with an unapproved device, or `invite_only` on an allowlisted address with an unapproved device | any navigation shows `/pending` | device status, `GET /api/diag` |
 
 Every shell also allows `/healthz`, the stylesheet, the shared script and the
 icon. The exact paths are in CONTRACTS §7.8.
@@ -692,9 +694,11 @@ in one function that every caller — the API handler **and** the reverter
 4. **The last Super Admin is immovable.** Demoting, suspending, disabling and
    reassigning all consult one guard that refuses if the change would leave no
    active Super Admin. It **fails closed**: if the count cannot be read, the
-   change is refused. The count includes unexpired temporary Super Admin
-   grants — so never demote the permanent owner while relying on a temporary
-   grant: when it lapses, nobody holds `*`.
+   change is refused. The count includes **permanent** Super Admins only — by
+   role, or by a temporary-role row with no expiry. A timed grant lapses on
+   its own, so it never stands in for the owner: while the last permanent
+   owner exists, a week-long Super Admin grant does not make them removable,
+   and a week later somebody still holds `*`.
 5. **Step-up.** A write that needs a dangerous permission requires a second
    factor proved within `step_up_minutes` (default 15), or the API answers
    `403 { step_up_required: true }` and the console re-prompts (§7.9).
@@ -1756,8 +1760,13 @@ milliseconds, and days in the portal's time zone:
 
 ```
 lastDay  = localDay(lastAt)
-base     = lastAt + windowHours·H
-hardCap  = base + maxLeewayDays·D + graceHours·H      // nothing can exceed this
+anchor   = lastAt
+if maxLeewayDays > 0 and isProtected(lastDay):   // signed in DURING a protected block
+    end     = the last day of that block (at most maxLeewayDays days long)
+    anchor  = firstInstantOf(end + 1)             // the window opens when the block ends
+    lastDay = end
+base     = anchor + windowHours·H
+hardCap  = lastAt + windowHours·H + maxLeewayDays·D + graceHours·H   // nothing can exceed this
 deadline = base
 repeat at most 8 rounds:
     endDay = localDay(deadline)
@@ -1775,7 +1784,8 @@ repeat at most 8 rounds:
 Read it term by term:
 
 - **Days strictly after the sign-in's own day** are counted. A day you signed in
-  on needs no excuse.
+  on needs no excuse — and if that day was itself protected, the window does
+  not start until the block ends (below).
 - **Each protected day adds 24 real hours**, up to the leeway cap
   (`streak_max_leeway_days`, default 4). A day of protection is a day of
   opportunity given back, which is the same thing B called "adding protected
@@ -1785,16 +1795,23 @@ Read it term by term:
   default calendar, every sign-in over several years converges within five
   rounds.
 
-**A property worth knowing.** Because days are counted from the day *after*
-the sign-in, a sign-in made **on** a protected day gets no leeway for the rest
-of that day. Combined with the anchor on the most recent sign-in, that means a
-sign-in can bring a deadline *earlier*: sign in at 11:30 PM on Friday and the
+**A sign-in during a protected block opens the window when the block ends.**
+B's formulation — the clock does not run in protected time — matters here.
+Counting only days *after* the sign-in's own day, with the window anchored on
+the most recent sign-in, has a trap: sign in at 11:30 PM on Friday and the
 deadline is 5:30 AM Monday; sign in again at 12:10 AM — now Saturday, a
-protected day — and it becomes 6:10 AM Sunday. It costs an observant person
-nothing, because they do not sign in at 12:10 AM on Shabbos; anyone who does
-can sign in again on Saturday, because for them it is not impossible; and the
-dashboard shows the new deadline at once. Among sign-ins on ordinary days, a
-later sign-in never yields an earlier deadline.
+protected day — and a plain 30-hour window from there ends at 6:10 AM
+**Sunday**. A later sign-in would have *cost* a day. An early draft of this
+design shipped exactly that, and a sweep over every half hour of two years
+found 146 such cases, all sign-ins made on protected days.
+
+So when the sign-in's own day is protected, the window starts at the first
+instant after that block (midnight, in the day model), and the block's days are
+not counted again as leeway. Saturday 12:10 AM and Saturday 9:00 PM both open
+the window at midnight going into Sunday and run to 6:00 AM Monday. The
+invariant is now unconditional and tested every half hour over two years on
+three calendars: **a later sign-in never yields an earlier deadline.** The hard
+cap is measured from the sign-in itself, so the late opening cannot widen it.
 
 ### 10.7 Re-entry grace
 
@@ -1821,7 +1838,7 @@ cushion for the hours of it that are not.
 ### 10.8 The hard cap, and why it exists
 
 ```
-hardCap = base + maxLeewayDays·D + graceHours·H      // defaults: 30 + 96 + 12 = 138 hours
+hardCap = lastAt + windowHours·H + maxLeewayDays·D + graceHours·H   // defaults: 30 + 96 + 12 = 138 hours
 ```
 
 The cap is **not for the calendar.** A real calendar with the defaults never
@@ -1859,7 +1876,7 @@ checked against the algorithm above.
 | Thu 8 Jan 2026, 11:00 PM | Shabbos | **Sun 12:00 PM** | 61 h | re-entry grace; leeway alone gave Sun 5:00 AM |
 | Fri 9 Jan 2026, 11:00 PM | Shabbos | Mon 5:00 AM | 54 h | one day of leeway; the grace (Sun noon) adds nothing |
 | Wed 1 Apr 2026, 11:00 PM | Pesach Thu–Fri, then Shabbos | Mon 5:00 AM | 102 h | three days of leeway |
-| Sat 10 Jan 2026, 9:00 PM | nothing ahead | Mon 3:00 AM | 30 h | a sign-in on a protected day counts and runs a plain window |
+| Sat 10 Jan 2026, 9:00 PM | the rest of Shabbos | Mon 6:00 AM | 33 h | the sign-in fell inside a block, so the window opens at midnight when it ends |
 | Fri 6 Mar 2026, 10:00 AM | Shabbos, then clocks spring forward | Sun **5:00 PM** | 54 h | one day of leeway; reads 5 PM because the night lost an hour |
 | Mon 5 Jan 2026, 12:30 AM | nothing | Tue 6:30 AM | 30 h | the base window: a sign-in at 11:30 PM Tuesday is 47 h later and starts again at 1 |
 
@@ -2162,9 +2179,9 @@ or a calendar bug found after the fact.
   of §10.9.
 - **Invariants over large ranges**, every half hour for several years in the
   portal zone: the deadline is never before the base window and never after
-  the hard cap; the loop converges before its round limit; among sign-ins on
-  ordinary days, a later sign-in never yields an earlier deadline (§10.6 says
-  why that last one is restricted to ordinary days).
+  the hard cap; the loop converges before its round limit; and a later
+  sign-in never yields an earlier deadline — on every half hour, protected
+  days included (§10.6 tells how that invariant was once false).
 - **The cap**, with a calendar on which every day is protected. Delete the cap
   and this must fail.
 - **Daylight saving**, with windows across both transitions in the portal zone

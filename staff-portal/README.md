@@ -36,6 +36,14 @@ contracts are in [docs/CONTRACTS.md](docs/CONTRACTS.md).
   themselves, a privacy notice on by default, and a hash-chained audit log with
   revert.
 
+**What it looks like** (headless Chromium, seeded first run):
+
+| | |
+|---|---|
+| ![The streak dashboard](docs/screenshots/dashboard.png) | ![The dashboard on a phone, dark mode](docs/screenshots/dashboard-phone-dark.png) |
+| ![Sign in](docs/screenshots/login.png) | ![Setting up an authenticator app, dark mode](docs/screenshots/authenticator-setup-dark.png) |
+| ![The hash-chained audit log](docs/screenshots/admin-audit.png) | ![Allowlist and blocklist](docs/screenshots/admin-network.png) |
+
 ## Requirements
 
 - **Node.js 22.13 or newer.** The tests run against `node:sqlite`, which needs no

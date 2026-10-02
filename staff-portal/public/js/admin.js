@@ -1575,7 +1575,7 @@ export const MODES = Object.freeze({
   fingerprint_gate: ['Fingerprint gate', 'Strangers get the sign-in page only after their browser reports a fingerprint that scores under the risk threshold.'],
   request_access: ['Request access', 'Strangers see a form to ask for access; approving a request sends them an invitation.'],
   allowlist: ['Allowlist (default)', 'Strangers see nothing unless their network is on the allowlist or their device is approved.'],
-  invite_only: ['Invite only', 'Strangers see nothing without a valid invitation link.'],
+  invite_only: ['Invite only', 'The network alone admits nobody: you get in on a device approved for you, or by accepting an invitation. An unknown device on an allowlisted network can only ask to be approved.'],
   lockdown: ['Lockdown', 'Nothing — except a Super Admin on an approved device from an allowlisted network. Everyone else’s sessions stop working.'],
 });
 

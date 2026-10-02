@@ -2,10 +2,12 @@
 
 import { test, assert, run } from '../helpers/t.js';
 import { loadPage, reply } from '../helpers/dom.js';
+import { DEFAULT_PRIVACY_NOTICE } from '../../src/policy.js';
 
 const ORIGIN = 'https://staff.example.com';
 const TOKEN = 'abc.DEF_ghi-123';
-const INFO = { email: 'sam@acme.com', full_name: 'Sam Example', org_name: 'Acme Inc.', expires_at: '2026-10-09T12:00:00Z' };
+// The real GET /api/invite/:token reply (src/api/public.js invitationInfo), notice included.
+const INFO = { email: 'sam@acme.com', full_name: 'Sam Example', org_name: 'Acme Inc.', expires_at: '2026-10-09T12:00:00.000Z', privacy_notice: DEFAULT_PRIVACY_NOTICE };
 const DONE = { ok: true, user: { id: 2 }, pinned: null, enroll_prompt: true, next: '/', streak: null };
 
 async function open({ token = TOKEN, fetch = {} } = {}) {

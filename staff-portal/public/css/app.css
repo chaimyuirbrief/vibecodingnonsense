@@ -9,7 +9,8 @@
  *            --text --text-muted --accent --accent-hover --accent-soft
  *            --accent-contrast --ok(-soft) --warn(-soft) --danger(-soft)
  *            --focus --flame-1 --flame-2 --flame-3 (amber → orange → red)
- *            --flame-soft --rest(-soft) (protected days, e.g. Shabbos)
+ *            --flame-soft --flame-dim (a short run) --flame-ink (flame text)
+ *            --rest(-soft) (protected days, e.g. Shabbos)
  *            --missed --qr-plate (always white)
  *   shape    --radius-sm --radius --radius-lg --radius-pill
  *   space    --space-1 … --space-8 (4 8 12 16 24 32 48 64 px), --gutter
@@ -86,6 +87,8 @@
   --flame-2: #ef7a1d;
   --flame-3: #d43a19;
   --flame-soft: #fff0dc;
+  --flame-dim: #f2cf8c;
+  --flame-ink: #b02f12;
   --rest: #6a5ed4;
   --rest-soft: #eceafc;
   --missed: #e4e7ec;
@@ -144,6 +147,8 @@
     --flame-2: #ff8c33;
     --flame-3: #ff5a36;
     --flame-soft: #36230f;
+    --flame-dim: #9a6a24;
+    --flame-ink: #ff8a5c;
     --rest: #a79dff;
     --rest-soft: #25213f;
     --missed: #272c37;
@@ -253,16 +258,21 @@ pre {
   vertical-align: middle;
 }
 
+/* Every declaration is !important: an element that is also a form control
+   (the hidden username field on the account page) would otherwise take the
+   inputs' width: 100% and push the page sideways. */
 .sr-only {
   position: absolute !important;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-  border: 0;
+  width: 1px !important;
+  height: 1px !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 .skip-link {
@@ -320,6 +330,16 @@ th.num {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* Opaque ids (a device's 22-character id) may break anywhere rather than
+   push their table wider than the page. */
+.break-anywhere {
+  overflow-wrap: anywhere;
 }
 
 .divider {
@@ -391,6 +411,10 @@ th.num {
   justify-content: flex-end;
 }
 
+.cluster-center {
+  justify-content: center;
+}
+
 .split {
   display: flex;
   flex-wrap: wrap;
@@ -460,11 +484,13 @@ th.num {
   letter-spacing: 0.02em;
 }
 
+/* Centred, like the link-style buttons above it: with one of its two
+   buttons hidden, space-between left the other stranded on the left. */
 .auth-foot {
   display: flex;
   flex-wrap: wrap;
-  justify-content: space-between;
-  gap: var(--space-2);
+  justify-content: center;
+  gap: var(--space-2) var(--space-4);
   margin-top: var(--space-5);
   padding-top: var(--space-4);
   border-top: 1px solid var(--border);
@@ -690,10 +716,25 @@ th.num {
   margin-top: var(--space-4);
 }
 
+/* A borderless button that leads a row starts its TEXT on the card's edge,
+   in line with the content above it, not its invisible padding. */
+.card-actions > .btn-ghost:first-child {
+  margin-left: calc(-1 * var(--space-4));
+}
+
+.card-actions > .btn-ghost.btn-sm:first-child {
+  margin-left: calc(-1 * var(--space-3));
+}
+
 @media (max-width: 480px) {
   .card {
-    padding: var(--space-4);
     border-radius: var(--radius);
+  }
+
+  /* Not a flush card: its table rows carry their own padding, and a second
+     16px here inset every row-card twice. */
+  .card:not(.card-flush) {
+    padding: var(--space-4);
   }
 }
 
@@ -892,6 +933,11 @@ th.num {
   gap: var(--space-2);
 }
 
+.label-row > label {
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
 .hint {
   color: var(--text-muted);
   font-size: var(--text-sm);
@@ -978,6 +1024,11 @@ input[readonly] {
   justify-content: flex-end;
 }
 
+/* A note under the submit button ("Accepting approves this browser…"). */
+.form-actions + .hint {
+  margin-top: var(--space-3);
+}
+
 input[type="checkbox"],
 input[type="radio"] {
   width: 18px;
@@ -1006,6 +1057,23 @@ input[type="radio"] {
 .input-group > input {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+/* The button keeps its label on one line; on a narrow screen it drops
+   under the value instead of squeezing to "Copy / key". */
+.input-group {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.input-group > :not(.btn) {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.input-group > .btn {
+  flex: none;
+  white-space: nowrap;
 }
 
 /* One-time codes: big, spaced, monospace, centred. */
@@ -1484,6 +1552,11 @@ dialog.modal::backdrop {
   background: var(--surface-2);
 }
 
+/* "2 minutes ago" on three lines makes every row three lines tall. */
+.table td > time {
+  white-space: nowrap;
+}
+
 .table tbody tr:last-child td {
   border-bottom: 0;
 }
@@ -1521,22 +1594,41 @@ dialog.modal::backdrop {
     border-bottom: 0;
   }
 
+  /* Inside a padded card the card already insets the rows. */
+  .card:not(.card-flush) .table-cards tr {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  /* Label column on the left, the value flowing beside it. Not a flex
+     row: a cell holding several nodes (a code, a line break and a sentence;
+     two badges) must wrap as text, not split into columns that push the
+     card off the screen. */
   .table-cards td {
-    display: flex;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding: var(--space-1) 0;
+    position: relative;
+    display: block;
+    min-height: calc(1.5em + var(--space-2));
+    padding: var(--space-1) 0 var(--space-1) min(38%, 9rem);
     border: 0;
-    text-align: right;
+    text-align: left;
+    overflow-wrap: break-word;
   }
 
   .table-cards td::before {
     content: attr(data-label);
+    position: absolute;
+    top: var(--space-1);
+    left: 0;
+    width: calc(min(38%, 9rem) - var(--space-3));
     color: var(--text-muted);
     font-size: var(--text-sm);
     font-weight: 600;
-    text-align: left;
-    flex: none;
+    line-height: 1.7;
+  }
+
+  .table-cards td[data-label=""] {
+    min-height: 0;
+    padding-left: 0;
   }
 
   .table-cards td[data-label=""]::before {
@@ -1550,22 +1642,37 @@ dialog.modal::backdrop {
 
 /* ------------------------------------------------------------- tabs --- */
 
+/* A segmented track. On a phone it scrolls sideways; from 900px it wraps,
+   so a console with every section (twelve tabs) never hides the last few
+   behind a scroll nobody sees. */
 .tabs [role="tablist"] {
   display: flex;
-  gap: var(--space-1);
-  border-bottom: 1px solid var(--border);
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
   overflow-x: auto;
   scrollbar-width: thin;
   margin-bottom: var(--space-5);
 }
 
+@media (min-width: 900px) {
+  .tabs [role="tablist"] {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+}
+
 .tabs [role="tab"] {
   position: relative;
-  padding: var(--space-3) var(--space-3);
+  padding: 7px var(--space-3);
   border: 0;
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--text-muted);
   font: inherit;
+  font-size: 0.9375rem;
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
@@ -1573,21 +1680,26 @@ dialog.modal::backdrop {
 
 .tabs [role="tab"]:hover {
   color: var(--text);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
 }
 
 .tabs [role="tab"][aria-selected="true"] {
   color: var(--accent);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm), 0 0 0 1px var(--border);
 }
 
-.tabs [role="tab"][aria-selected="true"]::after {
-  content: "";
-  position: absolute;
-  left: var(--space-2);
-  right: var(--space-2);
-  bottom: -1px;
-  height: 3px;
-  border-radius: 3px 3px 0 0;
-  background: var(--accent);
+/* Dark surfaces get lighter as they rise: the chosen tab sits above the
+   track, not sunk into it. */
+@media (prefers-color-scheme: dark) {
+  .tabs [role="tab"][aria-selected="true"] {
+    background: var(--surface-3);
+  }
+}
+
+/* Inside the track: the scroller would clip a ring drawn outside. */
+.tabs [role="tab"]:focus-visible {
+  outline-offset: -3px;
 }
 
 /* ------------------------------------------------------ chips/badges --- */
@@ -1640,7 +1752,7 @@ dialog.modal::backdrop {
 
 .badge-flame {
   background: var(--flame-soft);
-  color: var(--flame-3);
+  color: var(--flame-ink);
 }
 
 .dot {
@@ -1694,6 +1806,12 @@ dialog.modal::backdrop {
 
 .empty-body {
   max-width: 42ch;
+}
+
+/* An empty list with more below it (an add form) needs a line, not a hero. */
+.empty:not(:last-child) {
+  padding-top: var(--space-5);
+  padding-bottom: var(--space-5);
 }
 
 /* --------------------------------------------------------- skeleton --- */
@@ -1767,6 +1885,23 @@ dialog.modal::backdrop {
   .kv dd + dt {
     margin-top: var(--space-3);
   }
+}
+
+/* A few facts about what you're acting on (the invitation's email and
+   expiry), set apart from the form that follows. */
+.kv-box {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.stack > .kv-box:not(:first-child) {
+  margin-top: var(--space-4);
+}
+
+.stack > .kv-box + * {
+  margin-top: var(--space-5);
 }
 
 .disclosure {
@@ -1882,6 +2017,26 @@ ol.steps li::marker {
   color: var(--text-muted);
   font-size: var(--text-sm);
   margin-top: var(--space-1);
+}
+
+/* Sixteen tiles at phone width were a thousand pixels of scrolling. */
+@media (max-width: 480px) {
+  .stat-tiles {
+    gap: var(--space-2);
+  }
+
+  .stat {
+    padding: var(--space-3);
+  }
+
+  .stat-value {
+    font-size: 1.375rem;
+  }
+
+  .stat-label {
+    margin-top: 2px;
+    line-height: 1.35;
+  }
 }
 
 .meter-row {
@@ -2093,7 +2248,7 @@ progress {
 }
 
 .streak-state.state-at_risk {
-  color: var(--flame-3);
+  color: var(--flame-ink);
 }
 
 .streak-state.state-paused,
@@ -2312,7 +2467,7 @@ progress {
 
 .leaderboard li:nth-child(1) .rank {
   background: var(--flame-soft);
-  color: var(--flame-3);
+  color: var(--flame-ink);
 }
 
 /* ---------------------------------------------------- motion, print --- */
@@ -2431,6 +2586,33 @@ progress {
   flex: none;
 }
 
+/* A field with a hint under its input is taller than the button beside
+   it: line the button up with the input (one label line + the 6px field
+   gap below it), not with the bottom of the hint. */
+.toolbar:has(> .field > .hint) {
+  align-items: flex-start;
+}
+
+.toolbar:has(> .field > .hint) > .btn {
+  margin-top: calc(0.9375rem * 1.5 + 6px);
+}
+
+/* A lone filter ("Show: every decision") is a control, not a banner. */
+.toolbar > .field:only-child {
+  flex: 0 1 18rem;
+}
+
+/* A one-time code needs about 12 characters, not the whole card, and sits
+   at the button's height beside it. */
+.toolbar > .field:has(> .code-input) {
+  flex: 0 1 20rem;
+}
+
+.toolbar input.code-input {
+  font-size: 1.25rem !important;
+  padding: 6px var(--space-3) !important;
+}
+
 .section-head {
   display: flex;
   flex-wrap: wrap;
@@ -2440,7 +2622,11 @@ progress {
   margin-bottom: var(--space-4);
 }
 
-.sub-section + .sub-section {
+/* "~", not "+": a panel between two sub-sections (the backup codes, shown
+   once) must not glue the next one to it, and a sub-section after a list
+   (Devices → Approve another device) is a new block too. */
+.sub-section ~ .sub-section,
+.item-list ~ .sub-section {
   margin-top: var(--space-5);
   padding-top: var(--space-5);
   border-top: 1px solid var(--border);
@@ -2449,6 +2635,39 @@ progress {
 .sub-title {
   font-size: 1rem;
   margin-bottom: var(--space-1);
+}
+
+.sub-section > .hint:not(:last-child) {
+  margin-bottom: var(--space-3);
+}
+
+/* Settings groups ("General", "Streak calendar", "Refuse outright"): a
+   heading a step above the field labels inside, its note tucked under it,
+   and a rule between groups. */
+.settings-group > .sub-title {
+  font-size: var(--text-lg);
+  margin-bottom: 0;
+}
+
+.settings-group > .sub-title + .hint {
+  margin-top: var(--space-1);
+}
+
+.settings-group + .settings-group {
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--border);
+}
+
+/* "Add an address" under the list it adds to: a ruled-off block of its
+   own, not more rows of the table. */
+.add-form:not(:first-child) {
+  margin-top: var(--space-5);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--border);
+}
+
+.add-form > .sub-title + * {
+  margin-top: var(--space-3);
 }
 
 .linkish {
@@ -2492,6 +2711,22 @@ progress {
   display: grid;
   gap: var(--space-5);
   min-width: 0;
+}
+
+/* The three cards in the bottom row: the same gutter as the columns above,
+   and a shared height, so their buttons share a baseline. */
+.dash > .grid-3 {
+  gap: var(--space-5);
+}
+
+.dash > .grid-3 > .card {
+  display: flex;
+  flex-direction: column;
+}
+
+.dash > .grid-3 > .card > .card-actions {
+  margin-top: auto;
+  padding-top: var(--space-4);
 }
 
 .streak-body {
@@ -2655,8 +2890,8 @@ dl.streak-meta {
 /* Month labels over the columns, weekday labels beside the rows. */
 .strip-wrap {
   display: grid;
-  grid-template-columns: auto minmax(0, 520px);
-  gap: 4px 6px;
+  grid-template-columns: max-content minmax(0, 600px);
+  gap: 4px 8px;
 }
 
 .strip-months {
@@ -2695,7 +2930,7 @@ dl.streak-meta {
 }
 
 .strip-day.is-counted.lvl-1 {
-  background: color-mix(in srgb, var(--flame-1) 55%, var(--missed));
+  background: var(--flame-dim);
 }
 
 .strip-day.is-counted.lvl-2 {
@@ -2731,7 +2966,7 @@ dl.streak-meta {
 }
 
 .legend-swatch.lvl-1 {
-  background: color-mix(in srgb, var(--flame-1) 55%, var(--missed));
+  background: var(--flame-dim);
 }
 
 .legend-swatch.lvl-2 {
@@ -2785,16 +3020,57 @@ dl.streak-meta {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  flex: none;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
+.leaderboard .lb-count .flame {
+  flex: none;
+}
+
 .leaderboard .lb-longest {
+  flex: none;
   min-width: 5.5em;
   color: var(--text-muted);
   font-size: var(--text-sm);
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* On a phone the name gets the row: "best N" moves under it, and the
+   current count stays on the right, so nobody's name — yours least of
+   all — is cut to "Miriam Coh…". */
+@media (max-width: 520px) {
+  .leaderboard li {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    column-gap: var(--space-3);
+    row-gap: 0;
+  }
+
+  .leaderboard .rank {
+    grid-row: 1 / span 2;
+  }
+
+  .leaderboard .lb-name {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .leaderboard .lb-longest {
+    grid-column: 2;
+    grid-row: 2;
+    min-width: 0;
+    text-align: left;
+    font-weight: 400;
+  }
+
+  .leaderboard .lb-count {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+    font-size: 1.125rem;
+  }
 }
 
 .leaderboard li.is-me {
@@ -2942,6 +3218,12 @@ dl.streak-meta {
   color: var(--text);
 }
 
+/* On a phone the list scrolls sideways and would clip a ring drawn
+   outside the link. */
+.side-nav a:focus-visible {
+  outline-offset: -3px;
+}
+
 .side-nav a.is-current {
   background: var(--accent-soft);
   color: var(--accent);
@@ -3017,6 +3299,16 @@ dl.streak-meta {
   gap: var(--space-2);
 }
 
+/* A borderless button that ends a row ("Remove", "Forget") ends its TEXT
+   on the content edge, in line with the bordered buttons above it. */
+.item-actions > .btn-ghost:last-child {
+  margin-right: calc(-1 * var(--space-4));
+}
+
+.item-actions > .btn-ghost.btn-sm:last-child {
+  margin-right: calc(-1 * var(--space-3));
+}
+
 .item-edit {
   display: flex;
   flex-wrap: wrap;
@@ -3027,6 +3319,12 @@ dl.streak-meta {
 .item-edit > input {
   flex: 1 1 200px;
   min-width: 0;
+}
+
+/* While the setup panel is open its own Cancel/Confirm are the actions; a
+   second "Set up an authenticator app" would only mint another secret. */
+#totp-block:has(> .totp-setup:not([hidden])) #totp-start {
+  display: none;
 }
 
 .totp-setup {
@@ -3293,6 +3591,10 @@ th[aria-sort="none"] .sort-btn .icon {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-4);
+}
+
+.weekday-checks + .hint {
+  margin-top: var(--space-2);
 }
 
 .extra-dates {

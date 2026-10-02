@@ -44,6 +44,12 @@
 //   opts.matchMedia { '(prefers-color-scheme: dark)': true, … }
 //   opts.globals    extra globals to install (screen, RTCPeerConnection, …)
 //   opts.import     false → build the DOM and globals but import nothing
+//   opts.live       a tests/helpers/http.js Client (or a (url, init) =>
+//                   Response handler from live.js liveFetch): every fetch no
+//                   opts.fetch route answers goes to the REAL worker with
+//                   that Client's cookies, IP and cf. Records of those calls
+//                   carry live: true, status and response (parsed JSON).
+//                   See tests/helpers/live.js (openLive navigates first).
 //
 // Returns the page object: document, window, location, module (the imported
 // namespace), $(id), text(id), visible(id), fill(id, value), check(id, on),
@@ -674,6 +680,16 @@ class StubElement extends StubNode {
   }
   set checked(v) {
     this._checked = !!v;
+    // A radio group: checking one unchecks the others with the same name in
+    // the same form (or the document, outside a form), as browsers do.
+    if (this._checked && this.localName === 'input' && this.type === 'radio' && this.getAttribute('name')) {
+      const scope = this.closest('form') || this.ownerDocument;
+      if (scope) {
+        for (const other of querySelectorAll(scope, 'input')) {
+          if (other !== this && other.type === 'radio' && other.getAttribute('name') === this.getAttribute('name')) other._checked = false;
+        }
+      }
+    }
   }
   get maxLength() {
     const v = this.getAttribute('maxlength');
@@ -1241,6 +1257,12 @@ export async function loadPage(htmlFile, scriptFile, opts = {}) {
 
   const routes = { ...(opts.fetch || {}) };
   const seqIndex = new Map();
+  // opts.live: a (url, init) => Response handler, or a tests/helpers/http.js
+  // Client (bridged by tests/helpers/live.js) — see live.js.
+  let live = null;
+  if (typeof opts.live === 'function') live = opts.live;
+  else if (opts.live && typeof opts.live.request === 'function') live = (await import('./live.js')).liveFetch(opts.live);
+  else if (opts.live) throw new TypeError('test DOM: opts.live must be a function or a Client');
   async function fetchStub(input, init = {}) {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
     const method = String(init.method || 'GET').toUpperCase();
@@ -1252,11 +1274,31 @@ export async function loadPage(htmlFile, scriptFile, opts = {}) {
         // keep the raw string
       }
     }
-    const record = { method, path: url.pathname, url: url.pathname + url.search, body, headers: { ...(init.headers || {}) }, init };
+    const record = { method, path: url.pathname, url: url.pathname + url.search, body, headers: { ...(init.headers || {}) }, init, live: false, status: null, response: undefined, done: false };
     calls.fetch.push(record);
     const keys = [`${method} ${url.pathname}${url.search}`, `${method} ${url.pathname}`, `${url.pathname}`];
     const key = keys.find((k) => Object.hasOwn(routes, k));
+    if (!key && live) {
+      // tests/helpers/live.js: the real worker answers. The record keeps the
+      // status and the parsed reply so a suite can compare what the page
+      // shows with what the API really said.
+      record.live = true;
+      try {
+        const res = await live(url, init);
+        record.status = res.status;
+        const text = await res.clone().text();
+        try {
+          record.response = text ? JSON.parse(text) : null;
+        } catch {
+          record.response = text;
+        }
+        return res;
+      } finally {
+        record.done = true;
+      }
+    }
     if (!key) {
+      record.done = true;
       calls.unmatched.push(`${method} ${url.pathname}${url.search}`);
       return new Response(JSON.stringify({ error: 'unstubbed in test' }), { status: 404, headers: { 'content-type': 'application/json' } });
     }
@@ -1269,9 +1311,12 @@ export async function loadPage(htmlFile, scriptFile, opts = {}) {
     if (typeof r === 'function') r = await r(record);
     if (!r || r.__reply !== true) throw new Error(`test DOM: route '${key}' must give reply(status, body) — got ${JSON.stringify(r)}`);
     if (r.delayMs) await new Promise((res) => realSetTimeout(res, r.delayMs));
+    record.done = true;
     if (r.networkError) throw new TypeError('Failed to fetch');
     const payload = r.body === undefined || r.body === null ? null : typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
     const status = r.status;
+    record.status = status;
+    record.response = r.body;
     return new Response(status === 204 || status === 304 ? null : payload, { status, headers: { 'content-type': 'application/json', ...r.headers } });
   }
 

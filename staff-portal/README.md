@@ -93,6 +93,11 @@ browser is approved as a device, and you are asked to enrol a passkey or an
 authenticator app before anything else. Locally your address is loopback, which
 the allowlist will not accept; the device approval is what keeps you in.
 
+Browse `http://localhost:8787` exactly, the address in `ORIGIN`. On
+`http://127.0.0.1:8787` (what wrangler prints if you start it with
+`--ip 127.0.0.1`) the pages load but every form gets an empty 403, because a
+write must carry an `Origin` equal to `ORIGIN`.
+
 Use Chrome or Firefox locally: the portal's cookies are `Secure` and
 `__Host-` prefixed, which those browsers accept on `http://localhost`. If a
 browser refuses them, the sign-in page says so rather than looping.
@@ -106,15 +111,28 @@ npx wrangler d1 execute staff-portal --local \
 ```
 
 Locally the client address is whatever the request claims, defaulting to
-loopback, so you can test the gate as a public visitor:
+loopback, so you can test the gate as a public visitor. Give curl a browser's
+user agent: its own is refused as an automation tool (the `block_automation`
+setting) before the gate even looks at the address.
 
 ```sh
-curl -si -H 'CF-Connecting-IP: 81.2.69.142' http://localhost:8787/
+curl -si -A 'Mozilla/5.0 (X11; Linux x86_64) Chrome/141.0.0.0 Safari/537.36' \
+  -H 'CF-Connecting-IP: 81.2.69.142' http://localhost:8787/
 ```
 
-In production the edge sets that header and a client cannot. Local is more
-permissive than production in other ways too (SPEC §14.6): a passing local run
-is evidence, not proof.
+In production the edge sets that header and a client cannot. `request.cf` is a
+placeholder locally (wrangler falls back to a fixed one, a US address on
+AS395747 in `America/Chicago`, when it cannot fetch the real one, for example
+behind a proxy), and local requests arrive over HTTP/1.1, which adds 15 to
+every visit's risk score. Local is more permissive than production in other
+ways too (SPEC §14.6): PBKDF2 above 100,000 iterations works locally and
+fails in production. A passing local run is evidence, not proof.
+
+One thing goes the other way: local D1 enforces D1's real limits, which the
+node test suite does not (it runs on `node:sqlite`). A LIKE or GLOB pattern
+over 50 bytes fails with `LIKE or GLOB pattern too complex`, and a statement
+with more than 100 bound parameters fails with `too many SQL variables`. After
+changing SQL, walk the affected screens under `npm run dev`.
 
 ## Deploy
 

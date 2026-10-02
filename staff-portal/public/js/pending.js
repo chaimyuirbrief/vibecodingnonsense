@@ -8,7 +8,7 @@
 // "What did my browser send?" renders GET /api/diag — names and counts only
 // (A §5). The pending shell allows this script and common.js only.
 
-import { $, h, api, showError, copyText, toast, busy, fmtTime } from './common.js';
+import { $, h, api, ApiError, showError, copyText, toast, busy, fmtTime } from './common.js';
 
 const POLL_MS = 15000;
 const SLOW_POLL_MS = 60000;
@@ -79,6 +79,11 @@ function render(data) {
   }
 }
 
+// The gate's refusal, as opposed to an API error: no JSON body at all.
+function refusedByGate(err) {
+  return err instanceof ApiError && (err.status === 403 || err.status === 404) && (err.body === null || typeof err.body !== 'object');
+}
+
 function clearTimer() {
   if (state.timer !== null) clearTimeout(state.timer);
   state.timer = null;
@@ -104,7 +109,14 @@ async function check() {
   } catch (err) {
     el.paneLoading.hidden = true;
     el.paneCode.hidden = false;
-    showError(el.checkError, err);
+    if (refusedByGate(err)) {
+      // A blocked device never hears { status: 'blocked' }: the gate refuses
+      // it outright (CONTRACTS §7.8 step 1) with an empty 403, or the decoy
+      // 404. Say so once and stop asking.
+      showError(el.checkError, null);
+      render({ code: state.code, status: 'blocked' });
+      state.stopped = true;
+    } else showError(el.checkError, err);
   } finally {
     state.inFlight = false;
   }

@@ -147,6 +147,8 @@ async function putSettings(rc) {
 
 // ---------------------------------------------------------------- the gate
 
+// `now` is the server's clock: the console counts down against it, never
+// against the browser's, which may be minutes or months off.
 function gateView(rc, raw) {
   const s = gateOpenState(raw, rc.nowMs);
   return {
@@ -154,6 +156,7 @@ function gateView(rc, raw) {
     until: s.until === null ? null : iso(s.until),
     forever: s.forever,
     lockdown: rc.policy?.access_mode === 'lockdown',
+    now: iso(rc.nowMs),
   };
 }
 

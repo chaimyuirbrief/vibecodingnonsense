@@ -17,6 +17,8 @@ const ME = {
   user: USER,
   permissions: [],
   sources: {},
+  rank: 20,
+  is_super: false,
   pinned: null,
   enroll_prompt: false,
   step_up_fresh: false,
@@ -36,8 +38,8 @@ const SESSIONS = {
 
 const DEVICES = (status = 'approved') => ({
   devices: [
-    { id: 'd1', label: 'Chrome on macOS', status, last_seen_at: '2026-10-02T12:59:00Z', ip: '81.2.69.10', current: true },
-    { id: 'd2', label: 'Safari on iPhone', status: 'approved', last_seen_at: '2026-10-01T09:00:00Z', ip: '91.198.174.2', current: false },
+    { id: 'd1', label: 'Chrome on macOS', status, last_seen_at: '2026-10-02T12:59:00.000Z', first_seen_at: '2026-09-01T10:00:00.000Z', sign_ins: 40, ip: '81.2.69.10', current: true },
+    { id: 'd2', label: 'Safari on iPhone', status: 'approved', last_seen_at: '2026-10-01T09:00:00.000Z', first_seen_at: '2026-09-10T10:00:00.000Z', sign_ins: 3, ip: '91.198.174.2', current: false },
   ],
 });
 
@@ -53,7 +55,8 @@ const FP = {
   threshold: 70,
 };
 
-const ACTIVITY = [{ id: 3, at: '2026-10-02T13:00:00Z', action: 'login.success', outcome: 'success', detail: 'Signed in with passkey', ip: '81.2.69.10' }];
+// GET /api/me/activity → { entries } (src/api/me.js myActivity).
+const ACTIVITY = { entries: [{ id: 3, at: '2026-10-02T13:00:00.000Z', action: 'login.success', outcome: 'success', detail: 'Signed in with a passkey', ip: '81.2.69.10' }] };
 
 function routes(extra = {}) {
   return {
@@ -99,6 +102,33 @@ test('load: every section, the lists and the browser report; nothing unstubbed',
 // ------------------------------------------------------------- TOTP ----
 
 const ME_AFTER_TOTP = { ...ME, factors: { ...ME.factors, totp: true, backup: 10 } };
+
+test('TOTP removal refused (last_factor, the real 409): the sentence shows by the buttons, not in the hidden setup panel', async () => {
+  const ME_TOTP = { ...ME, passkeys: [], factors: { ...ME.factors, totp: true, passkeys: 0 } };
+  const page = await open({
+    fetch: {
+      'GET /api/me': reply(200, ME_TOTP),
+      'DELETE /api/me/mfa/totp': reply(409, { error: 'That’s your last way to confirm it’s you. Add another one first.', code: 'last_factor' }),
+    },
+  });
+  assert.ok(page.visible('totp-remove'));
+  await page.click('totp-remove');
+  await page.click(modalButton(page, 'btn-danger'));
+  assert.equal(page.requests('/api/me/mfa/totp', 'DELETE').length, 1);
+  assert.ok(!page.visible('totp-setup'));
+  assert.ok(page.visible('totp-action-error'));
+  assert.equal(page.text('totp-action-error'), 'That’s your last way to confirm it’s you. Add another one first.');
+  page.dispose();
+});
+
+test('TOTP begin failing: the error shows by the buttons', async () => {
+  const page = await open({ fetch: { 'POST /api/me/mfa/totp/begin': reply(500, { error: 'Something went wrong.' }) } });
+  await page.click('totp-start');
+  assert.ok(!page.visible('totp-setup'));
+  assert.ok(page.visible('totp-action-error'));
+  assert.equal(page.text('totp-action-error'), 'Something went wrong.');
+  page.dispose();
+});
 
 test('TOTP enrolment: QR on its own white plate, the secret grouped in fours, then backup codes exactly once', async () => {
   const page = await open({
@@ -497,7 +527,8 @@ test('this browser: the score, each flag’s plain-English reason and weight, th
 });
 
 test('password: checked client-side first; a wrong current password lands on that field', async () => {
-  const page = await open({ fetch: { 'POST /api/me/password': reply(401, { error: 'Your current password is wrong.' }), 'GET /api/auth/whoami': reply(200, { authenticated: true }) } });
+  // The real reply (users.changeOwnPassword): 400 naming the field.
+  const page = await open({ fetch: { 'POST /api/me/password': reply(400, { error: 'That isn’t your current password.', field: 'current' }), 'GET /api/auth/whoami': reply(200, { authenticated: true }) } });
   page.fill('pw-current', 'whatever it was');
   page.fill('pw-new', 'short');
   page.fill('pw-confirm', 'short');
@@ -511,7 +542,8 @@ test('password: checked client-side first; a wrong current password lands on tha
   page.fill('pw-confirm', 'correct horse battery staple');
   await page.submit('password-form');
   assert.equal(page.requests('/api/me/password').length, 1);
-  assert.equal(page.text('pw-current-error'), 'Your current password is wrong.');
+  assert.equal(page.text('pw-current-error'), 'That isn’t your current password.');
+  assert.ok(!page.visible('pw-error'), 'on the field, not in the general slot');
   assert.equal(page.$('pw-current').value, '');
   assert.deepEqual(page.calls.nav, [], 'a wrong password never signs anyone out');
   page.dispose();

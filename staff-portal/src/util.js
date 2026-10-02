@@ -31,6 +31,15 @@ export function nowIso(env) {
 }
 
 // Date.parse('42') is 2042-01-01. Require the shape first (SPEC §14.2).
+// SQL for "this column holds a util.iso() string" (24 chars). Two GLOBs, each
+// under D1's 50-byte LIKE/GLOB pattern limit: a single 77-byte GLOB passes
+// every node:sqlite test and throws "pattern too complex" in production, and
+// only when a row actually reaches it (tests/helpers/d1.js now refuses it).
+export function isoShapeSql(col) {
+  return `(length(${col}) = 24 AND substr(${col}, 1, 11) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T'` +
+    ` AND substr(${col}, 12) GLOB '[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')`;
+}
+
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export function parseIsoStrict(v) {

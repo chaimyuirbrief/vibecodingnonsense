@@ -7,8 +7,9 @@ import { loadPage, reply, drain } from '../helpers/dom.js';
 const ORIGIN = 'https://staff.example.com';
 const PANES = ['pane-password', 'pane-choose', 'pane-code', 'pane-otp', 'pane-passkey', 'pane-none', 'pane-cookie', 'pane-enroll'];
 const DONE = { ok: true, user: { id: 1 }, pinned: null, enroll_prompt: false, next: '/', streak: null };
-const SMS = { id: 4, kind: 'sms', hint: '•••• 1234' };
-const EMAIL = { id: 9, kind: 'email', hint: 'j•••@acme.com' };
+// As POST /api/auth/login lists them (src/api/auth.js afterPassword).
+const SMS = { id: 4, kind: 'sms', hint: '•••• 1234', label: null };
+const EMAIL = { id: 9, kind: 'email', hint: 'j•••@acme.com', label: 'Work' };
 
 const assertion = () => ({
   id: 'ignored',

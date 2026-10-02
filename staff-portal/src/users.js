@@ -146,10 +146,9 @@ function revokeSessionsStmt(db, userId, reason, at, onlyIfStatus) {
 // Admins removing each other at once both pass assertNotLastSuper, so the
 // write itself also requires ANOTHER active Super Admin to exist when it
 // lands. assertNotLastSuper stays the primary guard (it fails closed when the
-// count is unreadable); this only closes the race. Expiries are compared as
-// strings only after a shape check (CONTRACTS §0.7) — an unreadable one counts
-// as expired.
-const ISO_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z';
+// count is unreadable); this only closes the race. Like that guard it counts
+// PERMANENT owners only — a timed grant lapses on its own — so no expiry has
+// to be compared at all.
 const SUPER_ROLE_SQL = `r.key = '${SUPER_ROLE_KEY}' AND r.is_system = 1 AND r.permissions LIKE '%"*"%'`;
 const OTHER_SUPER_SQL = `EXISTS (
   SELECT 1 FROM users o JOIN roles r ON r.id = o.role_id
@@ -157,10 +156,10 @@ const OTHER_SUPER_SQL = `EXISTS (
   UNION ALL
   SELECT 1 FROM user_roles ur JOIN users o ON o.id = ur.user_id JOIN roles r ON r.id = ur.role_id
    WHERE o.id != ? AND o.status = 'active' AND ${SUPER_ROLE_SQL}
-     AND (ur.expires_at IS NULL OR (ur.expires_at GLOB '${ISO_GLOB}' AND ur.expires_at > ?)))`;
+     AND ur.expires_at IS NULL)`;
 
 function superGuard(needed, userId, nowMs) {
-  return needed ? { sql: ` AND ${OTHER_SUPER_SQL}`, args: [userId, userId, iso(nowMs)] } : { sql: '', args: [] };
+  return needed ? { sql: ` AND ${OTHER_SUPER_SQL}`, args: [userId, userId] } : { sql: '', args: [] };
 }
 
 // A guarded write that changed nothing: either the last-superuser rule
@@ -228,10 +227,6 @@ export function publicUser(row, role = null, { withLocked = false, nowMs } = {})
   return out;
 }
 
-function likeEscape(s) {
-  return s.replace(/[\\%_]/g, (c) => '\\' + c);
-}
-
 export async function listUsers(env, opts = {}) {
   const o = isPlainObject(opts) ? opts : {};
   const where = [];
@@ -242,8 +237,10 @@ export async function listUsers(env, opts = {}) {
   }
   const q = str(o.q, 100);
   if (q) {
-    const p = `%${likeEscape(q.toLowerCase())}%`;
-    where.push(`(lower(u.email) LIKE ? ESCAPE '\\' OR lower(u.username) LIKE ? ESCAPE '\\' OR lower(u.full_name) LIKE ? ESCAPE '\\' OR lower(u.employee_no) LIKE ? ESCAPE '\\')`);
+    // instr, not LIKE: D1 refuses LIKE patterns over 50 bytes, and a
+    // 49-character search (or 29 Hebrew letters) would be a 500.
+    const p = q.toLowerCase();
+    where.push(`(instr(lower(u.email), ?) > 0 OR instr(lower(coalesce(u.username, '')), ?) > 0 OR instr(lower(u.full_name), ?) > 0 OR instr(lower(coalesce(u.employee_no, '')), ?) > 0)`);
     args.push(p, p, p, p);
   }
   const roleId = toInt(o.role, 1);

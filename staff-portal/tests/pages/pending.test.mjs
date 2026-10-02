@@ -16,7 +16,7 @@ const DIAG = {
   asn: 20712,
   tls_version: 'TLSv1.3',
   http_protocol: 'HTTP/2',
-  device: { present: true, status: 'pending', code: 'K7F3-9QX2' },
+  device: { present: true, valid: true, status: 'pending', code: 'K7F3-9QX2' },
   session: { present: false, valid: false },
 };
 
@@ -105,6 +105,31 @@ test('blocked: says so and stops', async () => {
   assert.ok(page.visible('pane-blocked'));
   assert.equal(page.text('device-status'), 'Blocked');
   assert.equal(polls(page), 0);
+  page.dispose();
+});
+
+test('blocked while waiting: the gate’s bare refusal (the real reply — empty 403, or the decoy 404) shows the blocked pane and stops', async () => {
+  const DECOY = '<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>';
+  for (const refusal of [reply(403, null), reply(404, DECOY, { headers: { 'content-type': 'text/html' } })]) {
+    const page = await open([reply(200, PENDING), refusal]);
+    assert.ok(page.visible('pane-code'));
+    await page.fireTimers(15000);
+    assert.ok(page.visible('pane-blocked'), 'refused → blocked');
+    assert.ok(!page.visible('check-error'), 'not “You don’t have access to that.”');
+    assert.equal(page.text('device-code'), 'K7F3-9QX2', 'the code stays, to quote to an administrator');
+    assert.equal(page.text('device-status'), 'Blocked');
+    assert.ok(!page.visible('check-now'));
+    assert.equal(polls(page), 0, 'no more polling');
+    page.dispose();
+  }
+});
+
+test('an API error with a body is not mistaken for the gate: it is shown and polling continues', async () => {
+  const page = await open([reply(200, PENDING), reply(403, { error: 'Not allowed here.', code: 'forbidden' })]);
+  await page.fireTimers(15000);
+  assert.ok(!page.visible('pane-blocked'));
+  assert.equal(page.text('check-error'), 'Not allowed here.');
+  assert.equal(polls(page), 1);
   page.dispose();
 });
 

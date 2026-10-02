@@ -36,8 +36,14 @@ Section references like *A §14.1* or *B trap 4* point into those.
 6. **No external resources at all** — no CDN, web fonts, icon sets or QR
    services (A §2, §7.3).
 7. **Time:** stored as ISO-8601 UTC (`util.iso`), compared as strings in SQL
-   only when both sides came from `util.iso`. Wall-clock from `util.now(env)`
-   only — never `Date.now()` in `src/` (tests inject `env.__clock`).
+   only when both sides came from `util.iso` (`util.isoShapeSql(col)` checks
+   the shape in SQL). Wall-clock from `util.now(env)` only — never
+   `Date.now()` in `src/` (tests inject `env.__clock`).
+10. **Production D1 limits** that node:sqlite does not enforce (the test
+    stand-in does): at most **100 bound parameters** per statement, and
+    **LIKE/GLOB patterns of at most 50 bytes**, literal or bound. Search with
+    `instr()`, not `LIKE '%…%'`; chunk `IN (…)` lists. Each of these once
+    turned into a production 500 that every local test passed.
 8. **One function per shared path** (A §14.8): one `completeSignIn`, one
    `canDropFactor`, one `assertNotLastSuper`, one `validatePublicKey`.
 9. **The undo catalogue is one object** (A §9, §14.9): `reverters.js` exports
@@ -506,7 +512,7 @@ status = {
   counted_today,      // bool
   last_at, last_day, started_day,
   deadline,           // ISO or null
-  deadline_local,     // e.g. 'Sun 12:00 PM' in the portal zone, or null
+  deadline_local,     // e.g. 'Sun, Jan 11, 12:00 PM' in the portal zone, or null
   hours_left,         // number (1 decimal) or null
   protected_today: { names } | null,
   timezone,
@@ -944,7 +950,7 @@ charges `mfa_user` before verifying.
 |---|---|
 | GET /api/admin/settings | settings.view → `{ settings: [{ key, value, raw, default, perm, type, options, min, max, description, can_edit }] }` |
 | PUT /api/admin/settings | per key (§5) — `{ changes: { key: value } }` → `{ ok, applied: [...], warnings: [...], notices: [...] }`; blocking guards → 409 `{ code: 'self_lockout', error }` |
-| GET /api/admin/gate · POST /api/admin/gate/open `{ hours }` or `{ forever: true }` · POST /api/admin/gate/close | gate.open (reserved) |
+| GET /api/admin/gate · POST /api/admin/gate/open `{ hours }` or `{ forever: true }` · POST /api/admin/gate/close | gate.open (reserved) — replies `{ open, until, forever, lockdown, now }`; the console counts down against the server's `now`, never the browser clock |
 | GET /api/admin/network | network.view → `{ allow, block, you: { ip, country, asn, tier, covered_by } }` |
 | POST /api/admin/network/allow · PATCH …/allow/:id · DELETE …/allow/:id | network.manage |
 | POST /api/admin/network/block · DELETE …/block/:id | network.manage |
@@ -1149,6 +1155,9 @@ chars and arrays at 64 items, and rejects a body over 16 KiB.
   `cf` (one Client = one browser).
 - `tests/helpers/authenticator.js` → software passkeys (webauthn work).
 - `tests/helpers/dom.js` → minimal DOM stub for page scripts (ui work, A §13.4).
+- `tests/helpers/live.js` + `tests/integration/` → the real pages driven
+  against the real worker through the DOM stub (`openLive(client, path)`),
+  so a page and the API cannot drift apart unnoticed.
 - Client IPs in tests must look public (e.g. `81.2.69.0/24`, `91.198.174.0/24`,
   `185.15.56.0/24`): documentation ranges such as `203.0.113.0/24` are
   *reserved* and the allowlist rightly refuses them.

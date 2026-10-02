@@ -20,7 +20,7 @@ import { orgName, privacyNotice } from './auth.js';
 
 const SETUP_CLAIM_KEY = 'setup_claim';
 const SETUP_CLAIM_MS = 10 * MINUTE;
-const ISO_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z';
+const CLAIM_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|/;
 const COOKIE_NAME_RE = /^[\x21-\x7e]{1,64}$/;
 const HINT_HEADERS = Object.freeze([
   ['sec-ch-ua', 'sec_ch_ua'],
@@ -46,22 +46,43 @@ function requireSetupShell(rc) {
   if (rc.gate?.allowed !== 'shell' || rc.gate.shell !== 'setup') throw notFound();
 }
 
-// The one-shot claim (B trap 3): `<expiry ISO>|<random>` in meta, taken by
-// one conditional upsert so two setups at once cannot both hold it, and
-// EXPIRING, so a setup that died halfway can be retried rather than leaving
-// a portal with no accounts that refuses to create one. A claim value that
-// cannot be read is retakeable for the same reason; the conditional insert
-// in users.createOwner, not this row, is what makes a second owner impossible.
+// The one-shot claim (B trap 3): `<expiry ISO>|<random>` in meta, held by
+// one setup at a time, and EXPIRING, so a setup that died halfway can be
+// retried rather than leaving a portal with no accounts that refuses to
+// create one. A claim value that cannot be read is retakeable for the same
+// reason; the conditional insert in users.createOwner, not this row, is what
+// makes a second owner impossible.
+//
+// Whether a claim is still held is decided here, not in SQL: D1 refuses any
+// LIKE/GLOB pattern over 50 bytes ("LIKE or GLOB pattern too complex"),
+// which node:sqlite does not, so a shape check written as a GLOB passed every
+// test and made every retry — a racing setup, or the retry after a crashed
+// one — a 500 in the real runtime.
+function claimHeld(value, nowMs) {
+  const m = typeof value === 'string' ? CLAIM_RE.exec(value) : null;
+  return m !== null && m[1] > iso(nowMs);
+}
+
+// Insert when there is no claim; otherwise replace a stale one by
+// compare-and-swap on the exact value read, so of two setups that both saw
+// the same stale claim only one takes it.
 async function takeSetupClaim(env, nowMs) {
+  const db = env.DB;
   const value = `${iso(nowMs + SETUP_CLAIM_MS)}|${randomToken(16)}`;
-  const res = await env.DB.prepare(
-    `INSERT INTO meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value
-     WHERE meta.value IS NULL OR NOT (meta.value GLOB '${ISO_GLOB}|*') OR substr(meta.value, 1, 24) <= ?`,
-  )
-    .bind(SETUP_CLAIM_KEY, value, iso(nowMs))
-    .run();
-  return res.meta.changes === 1 ? value : null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ins = await db
+      .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+      .bind(SETUP_CLAIM_KEY, value)
+      .run();
+    if (ins.meta.changes === 1) return value;
+    const row = await db.prepare('SELECT value FROM meta WHERE key = ?').bind(SETUP_CLAIM_KEY).first();
+    if (!row) continue; // released between the two statements: insert again
+    const seen = row.value ?? null;
+    if (claimHeld(seen, nowMs)) return null;
+    const cas = await db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value IS ?').bind(value, SETUP_CLAIM_KEY, seen).run();
+    return cas.meta.changes === 1 ? value : null;
+  }
+  return null;
 }
 
 async function releaseSetupClaim(env, value) {

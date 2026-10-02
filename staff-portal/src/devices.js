@@ -466,26 +466,30 @@ export async function listDevices(env, opts = {}) {
     .all();
   const rows = results || [];
   const byDevice = new Map(rows.map((r) => [r.id, []]));
-  if (rows.length) {
-    const marks = rows.map(() => '?').join(',');
-    const { results: people } = await db
+  // D1 allows 100 bound parameters per statement, so the ledger lookup goes
+  // in chunks (a single IN list of 500 ids is a 500 in production).
+  const people = [];
+  for (let i = 0; i < rows.length; i += 90) {
+    const chunk = rows.slice(i, i + 90);
+    const { results: part } = await db
       .prepare(
         `SELECT du.device_id, du.user_id, du.first_seen, du.last_seen, du.sign_ins, u.email, u.full_name
          FROM device_users du LEFT JOIN users u ON u.id = du.user_id
-         WHERE du.device_id IN (${marks}) ORDER BY du.last_seen DESC`,
+         WHERE du.device_id IN (${chunk.map(() => '?').join(',')}) ORDER BY du.last_seen DESC`,
       )
-      .bind(...rows.map((r) => r.id))
+      .bind(...chunk.map((r) => r.id))
       .all();
-    for (const p of people || []) {
-      byDevice.get(p.device_id)?.push({
-        user_id: p.user_id,
-        email: p.email ?? null,
-        full_name: p.full_name ?? null,
-        sign_ins: p.sign_ins,
-        first_seen: p.first_seen,
-        last_seen: p.last_seen,
-      });
-    }
+    people.push(...(part || []));
+  }
+  for (const p of people) {
+    byDevice.get(p.device_id)?.push({
+      user_id: p.user_id,
+      email: p.email ?? null,
+      full_name: p.full_name ?? null,
+      sign_ins: p.sign_ins,
+      first_seen: p.first_seen,
+      last_seen: p.last_seen,
+    });
   }
   return Promise.all(rows.map(async (r) => ({ ...r, code: await deviceCode(r.id), users: byDevice.get(r.id) || [] })));
 }

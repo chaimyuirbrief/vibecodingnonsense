@@ -28,10 +28,13 @@ function meAs(key, perms = permsOf(key)) {
     user: { id: 1, full_name: 'Ada Admin', email: 'ada@acme.com', role: { id: r.id, key: r.key, name: r.name, rank: r.rank }, status: 'active' },
     permissions: perms,
     sources: {},
+    rank: r.rank,
+    is_super: key === 'super_admin',
     pinned: null,
     enroll_prompt: false,
     step_up_fresh: true,
     factors: { totp: true, totpUnreadable: false, passkeys: 1, backup: 8, destinations: 1 },
+    passkeys: [{ id: 'pk1', label: 'MacBook', created_at: iso(-30 * 24 * HOUR), last_used_at: iso(-HOUR) }],
     org_name: 'Acme Inc.',
     timezone: 'America/New_York',
     privacy_notice: null,
@@ -43,9 +46,9 @@ function settingsFor(perms) {
     settings: Object.values(SETTINGS).map((s) => ({
       key: s.key,
       label: s.label,
-      value: s.key === 'gate_open' ? { open: false, until: null, forever: false } : JSON.parse(JSON.stringify(s.default ?? null)),
+      value: s.key === 'gate_open' ? { open: false, until: null, forever: false, raw: null } : JSON.parse(JSON.stringify(s.default ?? null)),
       raw: null,
-      default: s.key === 'gate_open' ? '0' : s.default,
+      default: s.key === 'gate_open' ? { open: false, until: null, forever: false, raw: null } : s.default,
       perm: s.perm,
       type: s.type,
       options: s.options ? [...s.options] : null,
@@ -60,20 +63,27 @@ function settingsFor(perms) {
 const JANE = { id: 2, full_name: 'Jane Doe', email: 'jane@acme.com', username: 'jane', employee_no: 'ACME000002', role: { id: 5, key: 'employee', name: 'Employee', rank: 20 }, status: 'active', last_login_at: iso(-HOUR) };
 const SAM = { id: 3, full_name: 'Sam Levi', email: 'sam@acme.com', role: { id: 5, key: 'employee', name: 'Employee', rank: 20 }, status: 'suspended', last_login_at: iso(-30 * 24 * HOUR) };
 
+// The real GET /api/admin/users/:id shape (src/api/admin.js getPerson):
+// grants and denies at the top level, temp roles with the server's `active`.
 const JANE_DETAIL = {
-  user: { ...JANE, perm_grants: ['directory.view'], perm_denies: ['team.view'], locked: false },
+  user: { ...JANE, locked: false },
   permissions: ['directory.view'],
   sources: { 'directory.view': 'flag' },
   denied: ['team.view'],
-  temp_roles: [{ role_id: 3, role: { id: 3, name: 'Auditor' }, expires_at: iso(5 * 24 * HOUR) }],
+  rank: 20,
+  is_super: false,
+  perm_grants: ['directory.view'],
+  perm_denies: ['team.view'],
+  temp_roles: [{ role_id: 3, role: { id: 3, key: 'auditor', name: 'Auditor', rank: 60 }, expires_at: iso(5 * 24 * HOUR), granted_by: 1, active: true }],
   factors: { totp: true, totpUnreadable: false, passkeys: 1, backup: 5, destinations: 1 },
-  streak: { state: 'active', current: 5, longest: 9, last_day: '2026-10-02' },
+  streak: { state: 'active', current: 5, stored_current: 5, longest: 9, total_days: 20, counted_today: true, last_at: iso(-HOUR), last_day: '2026-10-02', started_day: '2026-09-28', deadline: iso(29 * HOUR), deadline_local: 'Sat 3:00 PM', hours_left: 29, protected_today: null, timezone: 'America/New_York' },
   invitation: null,
+  scope: 'all',
 };
 
 const AUDIT = {
   entries: [
-    { id: 101, seq: 57, at: iso(-HOUR), actor_id: 1, actor_label: 'Ada Admin', action: 'network.allow.remove', target_type: 'allow', target_id: '3', outcome: 'success', severity: 'notice', detail: 'Removed 91.198.174.0/24 (Coworking)', before: { cidr: '91.198.174.0/24' }, after: null, undo_kind: 'network.allow.remove', revertible: true, reverted_by: null },
+    { id: 101, seq: 57, at: iso(-HOUR), actor_id: 1, actor_label: 'Ada Admin', action: 'network.allow.remove', target_type: 'allowed_ip', target_id: '3', outcome: 'success', severity: 'notice', detail: 'Removed 91.198.174.0/24 (Coworking)', before: { cidr: '91.198.174.0/24' }, after: null, undo_kind: 'network.allow.remove', revertible: true, reverted_by: null },
     { id: 100, seq: 56, at: iso(-2 * HOUR), actor_id: 2, actor_label: 'Jane Doe', action: 'login.success', target_type: 'user', target_id: '2', outcome: 'success', severity: 'info', detail: 'Signed in with passkey', revertible: false, reverted_by: null },
     { id: 99, seq: 55, at: iso(-3 * HOUR), actor_id: 1, actor_label: 'Ada Admin', action: 'user.status', target_type: 'user', target_id: '3', outcome: 'success', severity: 'notice', detail: 'Suspended sam@acme.com', undo_kind: 'user.status', revertible: false, reverted_by: 120 },
   ],
@@ -97,26 +107,26 @@ function routes(perms, extra = {}) {
     'GET /api/admin/users/2/destinations': reply(200, { destinations: [{ id: 4, kind: 'sms', hint: '•••• 1234', label: 'Mobile', is_primary: true }] }),
     'GET /api/admin/roles': reply(200, { roles: ROLES }),
     'GET /api/admin/permissions': reply(200, { permissions: PERMISSIONS }),
-    'GET /api/admin/invitations': reply(200, { invitations: [{ id: 1, email: 'new@acme.com', full_name: 'New Person', created_at: iso(-HOUR), expires_at: iso(6 * 24 * HOUR), used_at: null, revoked_at: null }] }),
+    'GET /api/admin/invitations': reply(200, { invitations: [{ id: 1, user_id: 6, email: 'new@acme.com', role_id: 5, created_by: 1, full_name: 'New Person', user_status: 'invited', role_name: 'Employee', created_at: iso(-HOUR), expires_at: iso(6 * 24 * HOUR), used_at: null, revoked_at: null, state: 'pending' }] }),
     'GET /api/admin/requests': reply(200, { requests: [{ id: 5, email: 'req@acme.com', full_name: 'Rae Quest', reason: 'Starting Monday', status: 'pending', created_at: iso(-HOUR), ip: '81.2.69.40', country: 'GB', risk: 12 }] }),
     'GET /api/admin/devices': reply(200, {
       devices: [
-        { id: 'dv1', code: 'K7F3-9QX2', status: 'pending', label: 'Safari on iPhone', ip: '81.2.69.50', created_at: iso(-HOUR), users: [] },
-        { id: 'dv2', code: 'AB12-CD34', status: 'approved', label: 'Chrome on macOS', ip: '81.2.69.10', last_seen_at: iso(-60000), users: [{ id: 2, full_name: 'Jane Doe' }] },
+        { id: 'dv1', code: 'K7F3-9QX2', status: 'pending', label: 'Safari on iPhone', ua: null, platform: null, ip: '81.2.69.50', first_ip: '81.2.69.50', created_at: iso(-HOUR), last_seen_at: iso(-HOUR), approved_at: null, approved_by: null, blocked_at: null, users: [] },
+        { id: 'dv2', code: 'AB12-CD34', status: 'approved', label: 'Chrome on macOS', ua: null, platform: null, ip: '81.2.69.10', first_ip: '81.2.69.10', created_at: iso(-48 * HOUR), last_seen_at: iso(-60000), approved_at: iso(-47 * HOUR), approved_by: 1, blocked_at: null, users: [{ user_id: 2, email: 'jane@acme.com', full_name: 'Jane Doe', sign_ins: 4, first_seen: iso(-48 * HOUR), last_seen: iso(-60000) }] },
       ],
     }),
     'GET /api/admin/network': reply(200, NETWORK),
     'GET /api/admin/settings': reply(200, settingsFor(perms)),
-    'GET /api/admin/gate': reply(200, { open: false, until: null, forever: false }),
+    'GET /api/admin/gate': reply(200, { open: false, until: null, forever: false, lockdown: false, now: iso(0) }),
     'GET /api/admin/visitors': reply(200, {
-      visitors: [{ visitor_id: 'a1b2c3d4e5f6a7b8c9', last_seen: iso(-60000), ip: '185.15.56.7', country: 'NL', as_org: 'Hosting BV', risk: { score: 82, flags: [{ key: 'webdriver', weight: 60, reason: 'The browser says automation software is driving it (WebDriver).' }, { key: 'datacenter', weight: 22, reason: 'The network belongs to a hosting provider.' }] } }],
+      visitors: [{ id: 'f0e1d2', visitor_id: 'a1b2c3d4e5f6a7b8c9', first_seen: iso(-HOUR), last_seen: iso(-60000), hits: 3, risk: 82, flags: [{ key: 'webdriver', weight: 60, reason: 'The browser says automation software is driving it (WebDriver).' }, { key: 'datacenter', weight: 22, reason: 'The network belongs to a hosting provider.' }], ip: '185.15.56.7', country: 'NL', asn: 60781, as_org: 'Hosting BV', ua: null, user_id: null }],
       threshold: 70,
     }),
-    'GET /api/admin/visits': reply(200, { visits: [{ at: iso(-60000), decision: 'deny', reason: 'risk', method: 'GET', path: '/', ip: '185.15.56.7', country: 'NL', risk: 82 }] }),
+    'GET /api/admin/visits': reply(200, { visits: [{ id: 1, at: iso(-60000), decision: 'deny', reason: 'risk', method: 'GET', path: '/', ip: '185.15.56.7', country: 'NL', asn: 60781, visitor_id: 'a1b2c3d4e5f6a7b8c9', device_id: null, user_id: null, risk: 82, ua: null }], threshold: 70 }),
     'GET /api/admin/sessions': reply(200, {
       sessions: [
-        { id_ref: 'aaaaaaaaaaaa', user: { id: 1, full_name: 'Ada Admin' }, created_at: iso(-HOUR), last_seen_at: iso(-60000), ip: '81.2.69.10', aal: 2, current: true },
-        { id_ref: 'bbbbbbbbbbbb', user: { id: 2, full_name: 'Jane Doe' }, created_at: iso(-2 * HOUR), last_seen_at: iso(-HOUR), ip: '81.2.69.11', aal: 1, current: false },
+        { id_ref: 'aaaaaaaaaaaa', user_id: 1, user: { id: 1, full_name: 'Ada Admin', email: 'ada@acme.com' }, full_name: 'Ada Admin', email: 'ada@acme.com', device_id: 'dv2', created_at: iso(-HOUR), last_seen_at: iso(-60000), ip: '81.2.69.10', ua: null, aal: 2, current: true },
+        { id_ref: 'bbbbbbbbbbbb', user_id: 2, user: { id: 2, full_name: 'Jane Doe', email: 'jane@acme.com' }, full_name: 'Jane Doe', email: 'jane@acme.com', device_id: null, created_at: iso(-2 * HOUR), last_seen_at: iso(-HOUR), ip: '81.2.69.11', ua: null, aal: 1, current: false },
       ],
     }),
     'GET /api/admin/streaks': reply(200, {
@@ -415,8 +425,8 @@ test('security: every access mode is described', async () => {
 test('gate: opening needs an explicit choice; hours are validated, never defaulted', async () => {
   const page = await open('super_admin', {
     fetch: {
-      'POST /api/admin/gate/open': reply(200, { ok: true }),
-      'GET /api/admin/gate': [reply(200, { open: false, until: null, forever: false }), reply(200, { open: true, until: iso(6 * HOUR), forever: false })],
+      'POST /api/admin/gate/open': reply(200, { ok: true, open: true, until: iso(6 * HOUR), forever: false, lockdown: false, now: iso(0), notices: [] }),
+      'GET /api/admin/gate': [reply(200, { open: false, until: null, forever: false, lockdown: false, now: iso(0) }), reply(200, { open: true, until: iso(6 * HOUR), forever: false, lockdown: false, now: iso(0) })],
     },
   });
   await visit(page, 'security');
@@ -436,13 +446,48 @@ test('gate: opening needs an explicit choice; hours are validated, never default
   assert.match(page.document.querySelector('dialog.modal').textContent, /for the next 6 hours/);
   await page.click(dialogBtn(page, 'btn-danger'));
   assert.deepEqual(page.requests('/api/admin/gate/open')[0].body, { hours: 6 });
-  assert.match(page.text('gate-state'), /^Open to the internet until .* — closes in 5h 59m/);
+  assert.match(page.text('gate-state'), /^Open to the internet until .* — closes in (6h 00m|5h 59m)/, 'counted from the server’s `now`');
   assert.ok(page.$('gate-close'), 'and it can be closed');
   page.dispose();
 });
 
+test('gate: the countdown runs on the server’s clock (GET /api/admin/gate `now`), not the browser’s', async () => {
+  // The browser is a year ahead of the server: by its own clock the gate
+  // closed long ago. The page must still say ~2h, and must not reload.
+  const serverNow = NOW - 365 * 24 * HOUR;
+  const at = (ms) => new Date(serverNow + ms).toISOString();
+  const page = await open('super_admin', { fetch: { 'GET /api/admin/gate': reply(200, { open: true, until: at(2 * HOUR), forever: false, lockdown: false, now: at(0) }) } });
+  await visit(page, 'security');
+  assert.match(page.text('gate-countdown'), /^(1h 59m|2h 00m) \d\ds$/);
+  const before = page.requests('/api/admin/gate').length;
+  await page.fireTimers(1000);
+  await page.fireTimers(1000);
+  assert.equal(page.requests('/api/admin/gate').length, before, 'no reload: the server says it is still open');
+  page.dispose();
+});
+
+test('invitations: the server’s `state` decides Waiting/Expired, whatever the browser’s clock says', async () => {
+  const page = await open('super_admin', {
+    fetch: {
+      'GET /api/admin/invitations': reply(200, {
+        invitations: [
+          { id: 1, user_id: 6, email: 'fresh@acme.com', full_name: 'Fresh', created_at: iso(-400 * 24 * HOUR), expires_at: iso(-393 * 24 * HOUR), used_at: null, revoked_at: null, state: 'pending' },
+          { id: 2, user_id: 7, email: 'old@acme.com', full_name: 'Old', created_at: iso(-HOUR), expires_at: iso(HOUR), used_at: null, revoked_at: null, state: 'expired' },
+        ],
+      }),
+    },
+  });
+  await visit(page, 'invitations');
+  const row = (email) => page.document.querySelectorAll('#invitations-body tbody tr').find((tr) => tr.textContent.includes(email));
+  assert.ok(byText(row('fresh@acme.com'), '.badge', 'Waiting'));
+  assert.ok(byText(row('fresh@acme.com'), 'button', 'Revoke'), 'still revocable');
+  assert.ok(byText(row('old@acme.com'), '.badge', 'Expired'));
+  assert.equal(byText(row('old@acme.com'), 'button', 'Revoke'), null);
+  page.dispose();
+});
+
 test('gate: "until I close it" sends { forever: true }; cancelling the confirmation sends nothing', async () => {
-  const page = await open('super_admin', { fetch: { 'POST /api/admin/gate/open': reply(200, { ok: true }) } });
+  const page = await open('super_admin', { fetch: { 'POST /api/admin/gate/open': reply(200, { ok: true, open: true, until: null, forever: true, lockdown: false, now: iso(0), notices: [] }) } });
   await visit(page, 'security');
   page.check('gate-choice-forever');
   await page.submit('gate-form');
@@ -511,6 +556,22 @@ test('people: the detail shows each permission’s source; grants and denies are
   await page.click(byText(page.document, '#person-detail [data-write="users.roles"]', 'Save role and permissions'));
   const body = page.requests('/api/admin/users/2/role')[0].body;
   assert.deepEqual(body, { role_id: 5, perm_grants: ['directory.view', 'users.view'], perm_denies: ['team.view'] });
+  page.dispose();
+});
+
+test('people: a manager’s team view ({ user, streak, scope: team }) shows the person and their streak, and no Access card', async () => {
+  const page = await open('manager', {
+    fetch: { 'GET /api/admin/users/2': reply(200, { user: JANE, streak: JANE_DETAIL.streak, scope: 'team' }) },
+  });
+  await visit(page, 'people');
+  await page.click(page.document.querySelector('#people-list button[data-user-id="2"]'));
+  assert.equal(page.text('person-name'), 'Jane Doe');
+  const titles = page.document.querySelectorAll('#person-detail .card-title').map((t) => t.textContent);
+  assert.ok(titles.includes('Streak'));
+  assert.ok(!titles.includes('Access'));
+  assert.ok(!/No temporary roles/.test(page.text('person-detail')));
+  assert.equal(page.document.querySelectorAll('#person-detail [data-write]').length, 0);
+  assert.deepEqual(page.calls.pageErrors, []);
   page.dispose();
 });
 

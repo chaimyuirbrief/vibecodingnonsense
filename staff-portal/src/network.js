@@ -10,7 +10,7 @@
 // No anti-lockout logic lives here: guards.js (called by the API and the
 // reverters) uses coveringEntries and liveCount.
 
-import { iso, now, toInt, strStrict, parseIsoStrict, HOUR } from './util.js';
+import { iso, now, toInt, strStrict, parseIsoStrict, HOUR, isoShapeSql } from './util.js';
 import { parseIp, normalizeCidr, isPrivateOrReserved, isWholeFamily, cidrContains, bestMatch } from './ip.js';
 import { ValidationError, notFound } from './errors.js';
 
@@ -64,8 +64,7 @@ async function liveAllowRows(env, nowMs) {
 // is fetched too and judged by blockLive (unreadable → still blocking).
 async function liveBlockRows(env, nowMs) {
   const { results } = await env.DB.prepare(
-    `SELECT * FROM blocked_ips WHERE expires_at IS NULL OR expires_at > ?
-       OR expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'
+    `SELECT * FROM blocked_ips WHERE expires_at IS NULL OR expires_at > ? OR NOT ${isoShapeSql('expires_at')}
      ORDER BY id LIMIT ?`,
   )
     .bind(iso(nowMs), ROW_LIMIT)

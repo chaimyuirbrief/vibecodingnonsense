@@ -312,10 +312,6 @@ const LIST_COLUMNS = `a.id, a.seq, a.at, a.actor_id, a.actor_label, a.action, a.
   (SELECT r.id FROM audit_log r WHERE r.reverts_id = a.id AND r.action = 'audit.revert' AND r.outcome = 'success'
      ORDER BY r.seq DESC LIMIT 1) AS reverted_by`;
 
-function likeEscape(s) {
-  return s.replace(/[\\%_]/g, (c) => '\\' + c);
-}
-
 function blank(v) {
   return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
 }
@@ -330,8 +326,9 @@ export async function listAudit(env, filters = {}, { canRevert = false, revertib
 
   if (!blank(f.action)) {
     if (typeof f.action !== 'string') return none;
-    where.push(`a.action LIKE ? ESCAPE '\\'`);
-    args.push(likeEscape(str(f.action, 100)) + '%');
+    // Prefix match without LIKE: D1 caps LIKE patterns at 50 bytes.
+    where.push('instr(a.action, ?) = 1');
+    args.push(str(f.action, 100));
   }
   if (!blank(f.actor)) {
     const id = idOrNull(f.actor);
@@ -362,8 +359,8 @@ export async function listAudit(env, filters = {}, { canRevert = false, revertib
   }
   if (!blank(f.q)) {
     if (typeof f.q !== 'string') return none;
-    where.push(`a.detail LIKE ? ESCAPE '\\'`);
-    args.push('%' + likeEscape(str(f.q, 200)) + '%');
+    where.push('instr(lower(a.detail), ?) > 0');
+    args.push(str(f.q, 200).toLowerCase());
   }
   if (!blank(f.before_seq)) {
     const b = idOrNull(f.before_seq);

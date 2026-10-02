@@ -552,7 +552,10 @@ async function renderPerson(d) {
 
   cards.push(profileCard(user, base, area));
   cards.push(statusCard(user, base, area, self));
-  cards.push(await accessCard(d, user, base, area, self));
+  // A manager's team view of a report is { user, streak, scope: 'team' }:
+  // no permissions or temporary roles to show, so no Access card claiming
+  // "no temporary roles" from data the server never sent.
+  if (Array.isArray(d.permissions)) cards.push(await accessCard(d, user, base, area, self));
   if (can('users.reset_mfa') || can('users.reset_password') || can('users.suspend') || d.factors) cards.push(securityCard(d, user, base, area, self));
   if (can('destinations.manage')) cards.push(await destinationsCard(user, base, area));
   if (d.streak || can('streaks.manage')) cards.push(streakCard(d.streak, user, base, area));
@@ -760,7 +763,8 @@ function tempRoles(d, roles, base, area, self) {
         { class: 'item-list' },
         temp.map((t) => {
           const name = (t.role && t.role.name) || (roles.find((r) => r.id === t.role_id) || {}).name || `Role ${t.role_id}`;
-          const expired = t.expires_at && Date.parse(t.expires_at) < Date.now();
+          // `active` is the server's verdict on its own clock (GET /api/admin/users/:id).
+          const expired = typeof t.active === 'boolean' ? !t.active : !!t.expires_at && Date.parse(t.expires_at) < Date.now();
           return h(
             'li',
             { class: 'item-row' },
@@ -1015,11 +1019,16 @@ async function openInvite() {
   email.focus();
 }
 
-function invitationState(inv) {
-  if (inv.used_at) return ['Used', 'ok'];
-  if (inv.revoked_at) return ['Revoked', 'neutral'];
-  if (inv.expires_at && Date.parse(inv.expires_at) < Date.now()) return ['Expired', 'warn'];
-  return ['Waiting', 'accent'];
+const INVITATION_STATES = { pending: ['Waiting', 'accent'], used: ['Used', 'ok'], revoked: ['Revoked', 'neutral'], expired: ['Expired', 'warn'] };
+
+// The server's `state` (decided on its clock) wins; the fields are the
+// fallback for a reply without one.
+export function invitationState(inv) {
+  if (Object.hasOwn(INVITATION_STATES, inv.state)) return INVITATION_STATES[inv.state];
+  if (inv.used_at) return INVITATION_STATES.used;
+  if (inv.revoked_at) return INVITATION_STATES.revoked;
+  if (inv.expires_at && Date.parse(inv.expires_at) < Date.now()) return INVITATION_STATES.expired;
+  return INVITATION_STATES.pending;
 }
 
 async function loadInvitations(body) {
@@ -1138,7 +1147,7 @@ async function loadRoles(body) {
     columns: [
       { key: 'name', label: 'Role', render: (r) => h('span', null, h('strong', null, str(r.name)), r.description ? [h('br'), h('span', { class: 'small muted' }, str(r.description))] : null) },
       { key: 'rank', label: 'Rank', num: true },
-      { key: 'permissions', label: 'Grants', render: (r) => (Array.isArray(r.permissions) && r.permissions.includes('*') ? 'Everything' : plural(Array.isArray(r.permissions) ? r.permissions.length : 0, 'permission')) },
+      { key: 'permissions', label: 'Grants', className: 'nowrap', render: (r) => (Array.isArray(r.permissions) && r.permissions.includes('*') ? 'Everything' : plural(Array.isArray(r.permissions) ? r.permissions.length : 0, 'permission')) },
       { key: 'holders', label: 'People', num: true, render: (r) => (typeof r.holders === 'number' ? fmtNumber(r.holders) : '—') },
       { key: 'type', label: 'Type', render: (r) => (isSystem(r) ? badge('System', 'neutral') : badge('Custom', 'accent')) },
       {
@@ -1491,8 +1500,9 @@ async function loadNetwork(body) {
     const expires = expiresInput('allow-expires');
     allowForm = h(
       'form',
-      { id: 'allow-form', class: 'stack', novalidate: true },
-      h('div', { class: 'form-grid' }, field('Address or range', cidr, 'A public address or CIDR. Private ranges and 0.0.0.0/0 are refused — use the gate for that.'), field('Tier', tier), field('Label', label), field('Owner', owner), field('Expires after (hours)', expires, 'Leave empty for never — tier 4 gets 24 hours.')),
+      { id: 'allow-form', class: 'stack add-form', novalidate: true },
+      h('h4', { class: 'sub-title' }, 'Add an address'),
+      h('div', { class: 'form-grid' }, field('Address or range', cidr, 'A public address or CIDR. Private ranges and 0.0.0.0/0 are refused — use the gate for that.', { wide: true }), field('Tier', tier), field('Label', label), field('Owner', owner), field('Expires after (hours)', expires, 'Leave empty for never — tier 4 gets 24 hours.')),
       h('ul', { class: 'tier-help' }, [1, 2, 3, 4].map((t) => h('li', null, h('strong', null, `Tier ${t}, ${TIERS[t][0].toLowerCase()}: `), TIERS[t][1]))),
       h('div', { class: 'form-actions form-actions-row' }, submitBtn('network.manage', 'Add to allowlist')),
     );
@@ -1522,7 +1532,8 @@ async function loadNetwork(body) {
     const bexp = expiresInput('block-expires');
     blockForm = h(
       'form',
-      { id: 'block-form', class: 'stack', novalidate: true },
+      { id: 'block-form', class: 'stack add-form', novalidate: true },
+      h('h4', { class: 'sub-title' }, 'Block an address'),
       h('div', { class: 'form-grid' }, field('Address or range', bcidr), field('Reason', blabel), field('Expires after (hours)', bexp, 'Leave empty for never.')),
       h('div', { class: 'form-actions form-actions-row' }, submitBtn('network.manage', 'Block', { kind: 'danger' })),
     );
@@ -1690,7 +1701,7 @@ function settingField(s) {
     return out;
   }
   if (s.type === 'enum') {
-    const opts = (Array.isArray(s.options) ? s.options : []).map((o) => ({ value: o, label: key === 'streak_leaderboard' ? LEADERBOARD[o] || o : key === 'streak_region' ? (o === 'israel' ? 'Israel (one-day Yom Tov)' : 'Diaspora (two-day Yom Tov)') : humanize(o) }));
+    const opts = (Array.isArray(s.options) ? s.options : []).map((o) => ({ value: o, label: key === 'streak_leaderboard' ? LEADERBOARD[o] || o : key === 'streak_region' ? (o === 'israel' ? 'Israel (one day)' : 'Diaspora (two days)') : humanize(o) }));
     const input = select(opts, s.value, { id, disabled: !editable });
     out.input = input;
     out.el = field(label, input, hint);
@@ -1825,7 +1836,7 @@ function settingsForm({ formId, resultId, groups, onSaved, preview = false }) {
   const form = h(
     'form',
     { id: formId, class: 'stack-lg', novalidate: true },
-    groups.map((g) => h('div', { class: 'stack' }, h('h3', { class: 'sub-title' }, g.title), g.sub ? h('p', { class: 'hint' }, g.sub) : null, h('div', { class: 'form-grid' }, g.fields.map((f) => f.el)), g.preview ? previewEl : null)),
+    groups.map((g) => h('div', { class: 'stack settings-group' }, h('h3', { class: 'sub-title' }, g.title), g.sub ? h('p', { class: 'hint' }, g.sub) : null, h('div', { class: 'form-grid' }, g.fields.map((f) => f.el)), g.preview ? previewEl : null)),
     area,
     save ? h('div', { class: 'form-actions form-actions-row' }, save) : null,
   );
@@ -1904,8 +1915,15 @@ async function loadSecurity(body, banners = null) {
   body.replaceChildren(...parts);
 }
 
-function countdownText(untilMs) {
-  const left = Math.max(0, untilMs - Date.now());
+// The server's clock, as of this page load (GET /api/admin/gate `now`): a
+// browser clock that is off must not end the countdown early — or keep
+// reloading a gate the server still says is open.
+function serverNow(skewMs) {
+  return Date.now() + (Number.isFinite(skewMs) ? skewMs : 0);
+}
+
+function countdownText(untilMs, skewMs = 0) {
+  const left = Math.max(0, untilMs - serverNow(skewMs));
   const s = Math.floor(left / 1000);
   const hh = Math.floor(s / 3600);
   const mm = Math.floor((s % 3600) / 60);
@@ -1921,6 +1939,8 @@ async function gateCard() {
   const g = await api('GET', '/api/admin/gate');
   const open = !!(g && g.open);
   const until = g && g.until ? (typeof g.until === 'number' ? g.until : Date.parse(g.until)) : NaN;
+  const reported = g && typeof g.now === 'string' ? Date.parse(g.now) : NaN;
+  const skew = Number.isFinite(reported) ? reported - Date.now() : 0;
   const area = resultArea('gate-result');
   const state = h('div', { id: 'gate-state', class: 'gate-state' });
   if (open) {
@@ -1928,8 +1948,8 @@ async function gateCard() {
     state.append(badge('Open to the internet', 'danger'), ' ', g.forever ? h('span', null, 'until someone closes it') : h('span', null, `until ${fmtDateTime(until)} — closes in `, cd));
     if (!g.forever && Number.isFinite(until)) {
       const tick = () => {
-        cd.textContent = countdownText(until);
-        if (until <= Date.now() && S.gateTimer) {
+        cd.textContent = countdownText(until, skew);
+        if (until <= serverNow(skew) && S.gateTimer) {
           clearInterval(S.gateTimer);
           S.gateTimer = null;
           reload('security');
@@ -2071,7 +2091,7 @@ async function loadVisitors(body) {
           columns: [
             { key: 'at', label: 'When', render: (v) => ago(v.at) },
             { key: 'decision', label: 'Decision', render: (v) => badge(str(v.decision) || '—', v.decision === 'deny' ? 'danger' : v.decision === 'shell' ? 'warn' : 'ok') },
-            { key: 'reason', label: 'Why', render: (v) => str(v.reason) || '—' },
+            { key: 'reason', label: 'Why', render: (v) => humanize(v.reason) || '—' },
             { key: 'path', label: 'Asked for', render: (v) => h('code', null, `${str(v.method) || 'GET'} ${str(v.path)}`) },
             { key: 'ip', label: 'From', render: (v) => [str(v.ip), str(v.country)].filter(Boolean).join(' · ') || '—' },
             { key: 'risk', label: 'Risk', render: (v) => riskChip(v.risk, threshold) },
@@ -2228,7 +2248,7 @@ async function loadStreaks(body) {
     );
   };
   draw();
-  body.replaceChildren(area, card(null, r && r.scope === 'team' ? 'Your direct reports.' : 'Everyone.', holder));
+  body.replaceChildren(area, card(r && r.scope === 'team' ? 'Your direct reports' : 'Everyone', 'Current and longest runs. Adjust one to restore a streak lost to an outage.', holder));
 }
 
 function adjustStreak(area, s) {
@@ -2316,7 +2336,7 @@ function auditRow(e, area) {
     h('td', { 'data-label': 'When' }, ago(e.at)),
     h('td', { 'data-label': 'Who' }, str(e.actor_label) || (e.actor_id ? `#${e.actor_id}` : 'System')),
     h('td', { 'data-label': 'What' }, h('code', { class: 'small' }, str(e.action)), h('br'), str(e.detail)),
-    h('td', { 'data-label': 'Target' }, target),
+    h('td', { 'data-label': 'Target', class: 'break-anywhere' }, target),
     h('td', { 'data-label': 'Outcome' }, badge(str(e.outcome) || 'success', OUTCOME_KIND[e.outcome] || 'neutral'), ' ', badge(str(e.severity) || 'info', SEVERITY_KIND[e.severity] || 'neutral'), e.reverted_by ? [' ', badge(`Reverted by #${str(e.reverted_by)}`, 'rest')] : null),
     h('td', { 'data-label': '' }, h('div', { class: 'row-actions' }, revert, details)),
   );

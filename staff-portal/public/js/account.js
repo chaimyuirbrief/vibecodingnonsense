@@ -250,10 +250,15 @@ async function changePassword(e) {
     try {
       r = await api('POST', '/api/me/password', { current: cur.value, next: nw.value });
     } catch (err) {
-      if (err instanceof ApiError && err.status === 401 && !err.redirected) {
-        cur.value = '';
-        setFieldError(cur, err.message);
-        cur.focus();
+      // The API names the field it refused: 400 { field: 'current' } for a
+      // wrong current password, { field: 'next' } for a new one it won't take.
+      const field = err instanceof ApiError && !err.redirected && err.body && typeof err.body.field === 'string' ? err.body.field : null;
+      const input = field === 'current' ? cur : field === 'next' ? nw : null;
+      if (input) {
+        input.value = '';
+        if (input === nw) conf.value = '';
+        setFieldError(input, err.message);
+        input.focus();
       } else showError('pw-error', err);
       return;
     }
@@ -436,14 +441,17 @@ function clearTotpSetup() {
   showError('totp-error', null);
 }
 
+// Errors from starting or removing the app go next to its buttons: the
+// setup panel (and #totp-error inside it) is hidden at those moments.
 async function startTotp() {
   showError('totp-error', null);
+  showError('totp-action-error', null);
   await busy($('totp-start'), async () => {
     let r;
     try {
       r = await api('POST', '/api/me/mfa/totp/begin', {});
     } catch (err) {
-      showError('totp-error', err);
+      showError('totp-action-error', err);
       $('totp-setup').hidden = true;
       return;
     }
@@ -492,6 +500,7 @@ async function confirmTotp(e) {
 }
 
 async function removeTotp() {
+  showError('totp-action-error', null);
   const ok = await confirmDialog({
     title: 'Remove your authenticator app?',
     body: 'Codes from the app will stop working here. The portal won’t let you remove your last way to confirm it’s you.',
@@ -505,7 +514,7 @@ async function removeTotp() {
       toast('Authenticator app removed.', 'ok');
       await refreshMe();
     } catch (err) {
-      showError('totp-error', err);
+      showError('totp-action-error', err);
     }
   });
 }

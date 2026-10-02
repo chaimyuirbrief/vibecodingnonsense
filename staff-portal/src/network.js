@@ -115,15 +115,16 @@ function annotate(rows, live, nowMs, ip) {
   });
 }
 
-// Every row, expired ones included, each with `active` and — when the
-// caller's address is passed — `covers_ip`.
+// Every row, expired ones included (the newest 10,000 — the tables are never
+// trimmed), oldest first, each with `active` and — when the caller's address
+// is passed — `covers_ip`.
 export async function listAllowed(env, nowMs, ip) {
-  const { results } = await env.DB.prepare('SELECT * FROM allowed_ips ORDER BY id LIMIT ?').bind(ROW_LIMIT).all();
+  const { results } = await env.DB.prepare('SELECT * FROM (SELECT * FROM allowed_ips ORDER BY id DESC LIMIT ?) ORDER BY id').bind(ROW_LIMIT).all();
   return annotate(results || [], allowLive, clockOf(env, nowMs), ip);
 }
 
 export async function listBlocked(env, nowMs, ip) {
-  const { results } = await env.DB.prepare('SELECT * FROM blocked_ips ORDER BY id LIMIT ?').bind(ROW_LIMIT).all();
+  const { results } = await env.DB.prepare('SELECT * FROM (SELECT * FROM blocked_ips ORDER BY id DESC LIMIT ?) ORDER BY id').bind(ROW_LIMIT).all();
   return annotate(results || [], blockLive, clockOf(env, nowMs), ip);
 }
 

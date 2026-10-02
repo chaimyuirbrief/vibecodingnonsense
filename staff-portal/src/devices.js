@@ -17,7 +17,8 @@ export const DEVICE_STATUSES = Object.freeze(['pending', 'approved', 'blocked'])
 export const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0 1 I O L
 
 const COOKIE_MAX_AGE_SEC = 400 * 24 * 3600; // the browser ceiling for a cookie
-const ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const ID_RE = /^[A-Za-z0-9_-]{16,128}$/; // what we mint and sign
+const ANY_ID_RE = /^[\x21-\x7e]{1,128}$/; // what a lookup will consider
 const PENDING_CAP = 2000;
 const PENDING_STALE_MS = 30 * DAY;
 const CODE_WINDOW_MS = 7 * DAY;
@@ -47,7 +48,7 @@ function actorId(rc) {
 }
 
 function asDeviceId(v) {
-  return typeof v === 'string' && v.length >= 1 && v.length <= 128 ? v : null;
+  return typeof v === 'string' && ANY_ID_RE.test(v) ? v : null;
 }
 
 // 'none' | 'pending' | 'approved' | 'blocked'. An unrecognised status is
@@ -59,8 +60,10 @@ export function deviceState(row) {
 
 // ---------------------------------------------------------------- user agent
 
-const GENERIC_MODELS = new Set(['', 'k', 'mobile', 'tablet', 'desktop', 'android', 'unknown', 'wv', 'u', 'linux']);
+// Two characters at least: Chrome's reduced Android UA puts a placeholder
+// 'K' where the model was.
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9 _.+-]{1,39}$/;
+const GENERIC_MODELS = new Set(['mobile', 'tablet', 'desktop', 'android', 'unknown', 'wv', 'linux']);
 
 const BROWSERS = [
   // Chromium derivatives first: their user agents also say Chrome/.
@@ -72,17 +75,19 @@ const BROWSERS = [
   ['Safari', /\bVersion\/(\d+)[\d.]*(?: Mobile\/\w+)? Safari\//],
 ];
 
-const HINT_PLATFORMS = {
-  windows: 'Windows',
-  macos: 'macOS',
-  'mac os x': 'macOS',
-  android: 'Android',
-  'chrome os': 'ChromeOS',
-  chromeos: 'ChromeOS',
-  'chromium os': 'ChromeOS',
-  linux: 'Linux',
-  ios: 'iOS',
-};
+// A Map, not an object literal: a hint of "constructor" must not find
+// Object.prototype.constructor.
+const HINT_PLATFORMS = new Map([
+  ['windows', 'Windows'],
+  ['macos', 'macOS'],
+  ['mac os x', 'macOS'],
+  ['android', 'Android'],
+  ['chrome os', 'ChromeOS'],
+  ['chromeos', 'ChromeOS'],
+  ['chromium os', 'ChromeOS'],
+  ['linux', 'Linux'],
+  ['ios', 'iOS'],
+]);
 
 // Header form '"macOS"' and the JS form 'macOS' both arrive here.
 function unquote(v) {
@@ -128,9 +133,8 @@ export function parseUa(ua, hints) {
   // iPadOS asks for desktop sites with a Mac user agent; only touch tells.
   else if (/\bMacintosh\b|\bMac OS X\b/.test(u)) os = touch > 1 ? 'iPadOS' : 'macOS';
   else if (/\bLinux\b|\bX11\b/.test(u)) os = 'Linux';
-  if (!os) os = HINT_PLATFORMS[unquote(h.platform).toLowerCase()] || null;
+  if (!os) os = HINT_PLATFORMS.get(unquote(h.platform).toLowerCase()) || null;
 
-  // Chrome's reduced Android UA says "Android 10; K" — K is a placeholder.
   let model = null;
   if (os === 'Android') {
     const m = /\bAndroid [\d.]+; ([^;)]+?)(?: Build\/[^;)]*)?[;)]/.exec(u);
@@ -290,7 +294,7 @@ export async function trackDevice(rc, userId) {
 // digests are. Not a secret: it names a device to an administrator, and the
 // approve-by-code endpoints are step-up gated and rate-limited.
 export async function deviceCode(id) {
-  if (typeof id !== 'string' || !id) return null;
+  if (!asDeviceId(id)) return null;
   const n = CODE_ALPHABET.length;
   const limit = 256 - (256 % n);
   let out = '';

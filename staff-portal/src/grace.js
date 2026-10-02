@@ -21,8 +21,9 @@ function windowFor(tier) {
   return Number.isFinite(t) ? GRACE_MS[t] : 0;
 }
 
+// Device ids are printable tokens; whitespace or an over-long string is not one.
 function deviceKey(v) {
-  return typeof v === 'string' && v.length >= 1 && v.length <= 128 ? v : null;
+  return typeof v === 'string' && /^[\x21-\x7e]{1,128}$/.test(v) ? v : null;
 }
 
 // Called by completeSignIn only when a factor was ACTUALLY proved on this

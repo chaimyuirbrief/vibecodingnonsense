@@ -116,7 +116,7 @@ src/api/admin.js          people, roles, devices, sessions, streaks, audit (api-
 src/api/admin-security.js settings, network, gate, visitors               (api-admin)
 src/reverters.js          REVERTERS                                       (api-admin)
 src/guards.js             self-lockout guards for settings/network        (api-admin)
-public/                   pages, css, browser JS                          (ui-public, ui-app; fp.js: edge)
+public/                   pages, css, browser JS (incl. fp.js, webauthn.js) (ui-public, ui-app)
 tests/                    see §12
 ```
 
@@ -206,6 +206,52 @@ await auditError(rc, 'user.create', err, { target, detail });   // critical + re
 throw**. Scrubbing removes any key matching
 `/pass|secret|token|hash|salt|code|cookie|session/i` from `before`/`after`
 (recursively). `undo_payload` is not scrubbed — it is server-only.
+
+**Who writes the audit row.** Domain functions (users.js, devices.js,
+network.js, factors.js, streak.js, …) enforce their guards and return
+`{ prior, row }` (or what §7 says); **the API handler writes the audit row**,
+including the undo snapshot built from `prior`. A reverter calls the same
+domain function — so the same guards run again (B trap 5) — and the revert
+endpoint writes the single `audit.revert` row. Exceptions, audited by the
+domain function itself because no caller could know: `mfa.decrypt_failed`,
+`mfa.replay_floor_unreadable`, `mfa.passkey.counter_regressed`,
+`mfa.backup.used`. Domain functions may touch other tables with direct SQL for
+side effects (e.g. dropping `mfa_grace` rows) rather than importing a sibling
+module, to keep the dependency graph shallow.
+
+### 4.2.1 Undo kinds and payloads
+
+`undo.js` exports `UNDO_KINDS` (this exact list) and
+`undoFor(kind, payload)`, which throws on a kind not in the list.
+`reverters.js` exports `REVERTERS` with exactly these keys and throws at
+import if the two sets differ; a test also scans `src/` for every
+`undoFor('…')` call and checks the kind (A §9, §14.9). Payloads are the
+**prior** state:
+
+| kind | payload | revert does |
+|---|---|---|
+| `user.status` | `{ userId, status }` | `users.setStatus` back (rank, self, last-super guards) |
+| `user.role` | `{ userId, role_id, perm_grants, perm_denies }` | `users.changeRole` back (rank, minting, grant, last-super) |
+| `user.temp_role` | `{ userId, roleId, prior: { expires_at, granted_by } \| null }` | restore the row, or revoke it if `prior` is null |
+| `user.profile` | `{ userId, fields: { …prior values of changed fields } }` | `users.updateProfile` back |
+| `device.status` | `{ deviceId, status }` | `devices.setDeviceStatus` back |
+| `device.label` | `{ deviceId, label }` | `devices.renameDevice` back |
+| `network.allow.add` | `{ id }` | remove it — through the anti-lockout guards |
+| `network.allow.remove` | `{ row }` | re-add it — through validation |
+| `network.allow.edit` | `{ id, prior: { tier, label, owner, user_id, expires_at } }` | edit back — guards |
+| `network.block.add` | `{ id }` | remove the block |
+| `network.block.remove` | `{ row }` | re-add — the self-block guard applies |
+| `setting` | `{ key, prior }` (raw string or null) | write it back through validation and the self-lockout guards. Never recorded for `gate_open`. |
+| `mfa.reset` | `{ userId, totp, passkeys, backup, grace }` (rows as stored; TOTP still encrypted) | restore — refused if the user has enrolled anything since |
+| `role.create` | `{ roleId }` | delete it (refused while anyone holds it) |
+| `role.edit` | `{ roleId, prior: { name, rank, permissions, description } }` | edit back (reserved/minting checks) |
+| `role.delete` | `{ row }` | recreate it with the same key |
+| `streak` | `{ userId, prior }` (streaks row or null) | restore the row (or delete if null) |
+| `destination.add` | `{ userId, id }` | remove it (never the last usable factor) |
+| `destination.remove` | `{ userId, row }` | re-add it |
+
+Not revertible, by design: sign-ins, password changes and resets, session
+revocation, invitations, gate open/close, audit reverts themselves.
 
 ### 4.3 Action names
 
@@ -559,9 +605,10 @@ userFactors(env, userId) → { totp: bool, totpUnreadable: bool, passkeys: n, ba
 availableMethods(env, userId) → ['passkey' | 'totp' | 'backup' | 'email' | 'sms', ...]   // strongest first
 hasStrongFactor(env, userId) → bool          // passkey or confirmed TOTP; backup codes alone do NOT count (A §7.1)
 canDropFactor(env, userId, dropping: 'totp' | 'passkey' | { destinationId }) → bool
-resetFactors(rc, userId) → { cleared }       // admin "lost phone": totp + passkeys + backup + grace;
+resetFactors(rc, userId) → { cleared, prior }   // admin "lost phone": totp + passkeys + backup + grace;
                                              // refuses (GuardError 'nothing_left') unless a usable destination remains;
-                                             // records undo 'mfa.reset' with the encrypted TOTP blob, passkey rows, backup rows
+                                             // prior = the 'mfa.reset' undo payload (encrypted TOTP blob, passkey rows, backup rows, grace rows)
+restoreFactors(rc, prior) → void             // the reverter's half; refuses if anything was enrolled since
 
 // notify.js
 smsConfigured(env), emailConfigured(env) → bool
@@ -959,7 +1006,10 @@ Sunday, not 5am.
 
 - No row → `current = longest = total_days = 1`, `started_day = last_day =
   today`, `last_at = now`.
-- `last_at` unreadable → restart at 1 (longest kept) and audit `streak.error`.
+- `last_at` unreadable → restart at 1 (longest kept) and return the status
+  with `repaired: 'unreadable_last_at'`; `completeSignIn` audits
+  `streak.error` when it sees that field (streak.js itself never imports the
+  audit module).
 - `last_at` more than 5 minutes in the future (a clock moved, a restore) →
   **hold**: change nothing (A §11).
 - Same local day as `last_day` → `last_at = max(last_at, now)` only.
@@ -996,9 +1046,12 @@ counted) · `at_risk` (not counted today and < 6h left) · `active`.
   `getPasskey(options)` — base64url ⇄ ArrayBuffer both directions, with a loop
   (A §7.4); returns the wire shapes of §7.5. `NotAllowedError`/`AbortError`
   become `{ cancelled: true }` (A §7.6).
-- `public/js/fp.js` (edge work): `collectSignals({ deadlineMs = 1500 })` and
-  `reportFingerprint()` → never throws, every probe individually trapped,
-  resolves `{ ok }`.
+- `public/js/fp.js` (ui-public work): `collectSignals({ deadlineMs = 1500 })`
+  and `reportFingerprint()` → never throws, every probe individually trapped
+  behind one overall deadline, resolves `{ ok }`. A probe that throws or times
+  out is listed in `blocked` — the absence is itself a signal (B §6). The
+  signal object is §10.1; `fingerprint.sanitizeClientSignals` accepts exactly
+  that shape.
 - Dark mode via `prefers-color-scheme` with tokens on `:root`; no toggle. The
   QR image always sits on its own white plate.
 - Login state machine: A §7.6 exactly — auto-sent code, one method opens
@@ -1012,6 +1065,40 @@ counted) · `at_risk` (not counted today and < 6h left) · `active`.
   Shabbos" when today is protected, the 12-week history strip (counted /
   protected / missed / today), the next three weeks of protected days, the
   rules in one sentence, and the leaderboard when the setting allows.
+
+### 10.1 Client fingerprint signals (`POST /api/fp { signals }`)
+
+Every field optional; the server drops unknown keys, caps strings at 256
+chars and arrays at 64 items, and rejects a body over 16 KiB.
+
+```js
+{
+  v: 1,
+  ua: string, platform: string, vendor: string,
+  uaData: { brands: [{ brand, version }], mobile: bool, platform: string } | null,   // Chromium only — a bonus
+  language: string, languages: string[],
+  tz: string, tzOffset: number,                              // minutes, as getTimezoneOffset()
+  intl: { locale, calendar, numberingSystem, hourCycle },
+  screen: { w, h, aw, ah, cd, dpr },
+  window: { iw, ih, ow, oh },
+  hw: { cores, memory, touch },                              // hardwareConcurrency, deviceMemory, maxTouchPoints
+  media: { dark, reducedMotion, contrast, pointerCoarse, hover, gamut, forcedColors },
+  canvas: string | null,                                     // SHA-256 hex of a fixed drawing
+  webgl: { vendor, renderer, hash } | null,
+  audio: string | null,                                      // OfflineAudioContext hash
+  fonts: string[],                                           // detected from a fixed list
+  storage: { cookies, local, session, idb, quotaMb },
+  net: { type, downlink, rtt, saveData } | null,
+  perms: { notifications, geolocation, camera, microphone } | null,   // permission states
+  webrtc: { candidates, mdns, ipv6 } | null,                 // host candidates only — no STUN, CSP forbids it
+  math: string,                                              // hash of a fixed set of Math results
+  features: { [api]: bool },                                 // feature matrix
+  automation: string[],                                      // named tells, e.g. 'webdriver', 'headless-ua',
+                                                             // 'no-plugins', 'zero-outer', 'swiftshader', 'cdc'
+  blocked: string[],                                         // probes that threw or timed out
+  elapsedMs: number
+}
+```
 
 ---
 

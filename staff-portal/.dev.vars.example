@@ -3,3 +3,8 @@
 SESSION_SECRET=replace-with-48-random-bytes-base64url
 DATA_KEY=replace-with-a-DIFFERENT-48-random-bytes-base64url
 SETUP_KEY=replace-with-48-random-bytes-base64url
+
+# Local development only: wrangler.jsonc's ORIGIN and RP_ID name the real
+# domain, but the CSRF check and passkeys need the address you browse.
+ORIGIN=http://localhost:8787
+RP_ID=localhost

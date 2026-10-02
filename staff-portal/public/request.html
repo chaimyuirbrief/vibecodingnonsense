@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Request access</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/request.js"></script>
+</head>
+<body data-page="request">
+<a class="skip-link" href="#main">Skip to the form</a>
+<main id="main" class="auth">
+  <div class="card auth-card">
+    <header class="auth-head">
+      <p class="auth-org">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <rect x="5" y="11" width="14" height="9" rx="2"></rect>
+            <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+          </svg>
+        </span>
+        <span>Staff portal</span>
+      </p>
+      <h1 id="title">Request access</h1>
+      <p id="intro" class="muted">This portal is for staff. If you work here, tell us who you are and an administrator will review your request.</p>
+    </header>
+
+    <section id="pane-form" aria-labelledby="title">
+      <form id="form-request" novalidate>
+        <div class="field">
+          <label for="full_name">Full name</label>
+          <input id="full_name" name="full_name" type="text" autocomplete="name" maxlength="120" required>
+          <p id="full_name-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="email">Work email</label>
+          <input id="email" name="email" type="email" autocomplete="email" autocapitalize="none" spellcheck="false" maxlength="254" required>
+          <p id="email-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <div class="label-row">
+            <label for="reason">Why do you need access?</label>
+            <span id="reason-count" class="hint num" aria-live="polite">0 / 500</span>
+          </div>
+          <textarea id="reason" name="reason" rows="4" maxlength="500" required aria-describedby="reason-hint"></textarea>
+          <p id="reason-hint" class="hint">Your team, your manager and what you’ll use the portal for.</p>
+          <p id="reason-error" class="field-error" hidden></p>
+        </div>
+        <p id="request-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="request-submit" class="btn btn-primary btn-block" type="submit">Send request</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="pane-thanks" aria-labelledby="thanks-heading" tabindex="-1" hidden>
+      <div class="banner banner-ok">
+        <div class="banner-body">
+          <p id="thanks-heading" class="banner-title">Thanks — your request has been received</p>
+          <p>If it’s approved, an administrator will send you an invitation link. There’s no need to send it again.</p>
+        </div>
+      </div>
+    </section>
+
+    <p id="privacy" class="privacy-note">
+      <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5M12 7.5v.5"></path></svg>
+      <span>To keep staff accounts safe, this portal records technical details of each visit: your IP address and approximate location, and characteristics of your device and browser.</span>
+    </p>
+  </div>
+  <p class="auth-below">Already have an account? Ask an administrator to approve this browser or this network.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Staff portal mark: the streak flame on the accent plate. -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#d43a19"/>
+      <stop offset="0.55" stop-color="#ef7a1d"/>
+      <stop offset="1" stop-color="#f6b52c"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="#2443b8"/>
+  <g transform="translate(4 3.4)">
+    <path fill="url(#g)" d="M12 2.5c.6 3.1 2.9 4.9 4.6 7 1.4 1.7 2.4 3.6 2.4 5.9A7 7 0 0 1 5 15.4c0-2.6 1.3-4.6 3-6.1.2 1.6.9 2.9 2.2 3.6-.4-3.9.3-7.4 1.8-10.4z"/>
+    <path fill="#f6b52c" fill-opacity="0.9" d="M12 21a3.6 3.6 0 0 1-3.6-3.6c0-1.9 1.2-3.1 2.4-4.3.3 1 .9 1.7 1.8 2 .1-1.5.5-2.6 1.3-3.6 1.1 1.6 1.7 3.4 1.7 5.6A3.6 3.6 0 0 1 12 21z"/>
+  </g>
+</svg>

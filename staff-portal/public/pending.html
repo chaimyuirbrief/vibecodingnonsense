@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Waiting for approval</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/pending.js"></script>
+</head>
+<body data-page="pending">
+<a class="skip-link" href="#main">Skip to the device code</a>
+<main id="main" class="auth">
+  <div class="card auth-card">
+    <header class="auth-head">
+      <p class="auth-org">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <rect x="4" y="5" width="16" height="11" rx="1.5"></rect>
+            <path d="M2 19h20"></path>
+          </svg>
+        </span>
+        <span>Staff portal</span>
+      </p>
+      <h1 id="title">This browser needs approval</h1>
+      <p class="muted">Before it can be used, an administrator has to approve this browser.</p>
+    </header>
+
+    <section id="pane-loading" aria-label="Loading">
+      <div class="skeleton" aria-hidden="true">
+        <span class="skeleton-block"></span>
+        <span class="skeleton-line"></span>
+        <span class="skeleton-line"></span>
+      </div>
+    </section>
+
+    <section id="pane-code" class="stack" aria-labelledby="code-heading" hidden>
+      <div class="split">
+        <p id="code-heading" class="label">Your device code</p>
+        <span id="device-status" class="badge badge-warn" role="status">Waiting for approval</span>
+      </div>
+      <p id="device-code" class="device-code" aria-hidden="true">····-····</p>
+      <p id="device-code-sr" class="sr-only"></p>
+      <p id="device-label" class="muted small center" hidden></p>
+      <div class="cluster cluster-end">
+        <button id="copy-code" class="btn btn-ghost btn-sm" type="button">Copy code</button>
+      </div>
+
+      <div class="stack">
+        <h2 class="card-title">What to do next</h2>
+        <ol class="steps stack-sm">
+          <li><strong>Read this code to an administrator</strong> — by phone, in person or in chat. They’ll find it under Admin → Devices.</li>
+          <li>Or, if you’re already signed in on an approved device, open <strong>Account → Devices → Approve a device</strong> there and type the code.</li>
+          <li>Leave this page open. It checks every 15 seconds and will tell you when you’re approved.</li>
+        </ol>
+      </div>
+
+      <div class="form-actions">
+        <button id="check-now" class="btn btn-secondary btn-block" type="button">Check again</button>
+        <p id="checked-at" class="hint center" aria-live="polite"></p>
+      </div>
+      <p id="check-error" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <section id="pane-approved" aria-labelledby="approved-heading" hidden>
+      <div class="banner banner-ok">
+        <div class="banner-body">
+          <p id="approved-heading" class="banner-title">This browser is approved</p>
+          <p>You can sign in now.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <a id="continue" class="btn btn-primary btn-block" href="/">Continue to sign in</a>
+      </div>
+    </section>
+
+    <section id="pane-blocked" aria-labelledby="blocked-heading" hidden>
+      <div class="banner banner-danger">
+        <div class="banner-body">
+          <p id="blocked-heading" class="banner-title">This browser has been blocked</p>
+          <p>An administrator blocked this device. If you think that’s a mistake, contact them and quote the code above.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="disclosure">
+      <button id="diag-toggle" type="button" aria-expanded="false" aria-controls="diag-panel">
+        <span>What did my browser send?</span>
+        <svg class="icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M6 9l6 6 6-6"></path></svg>
+      </button>
+      <div id="diag-panel" class="disclosure-panel" hidden>
+        <p class="hint">What the portal received from this browser — cookie names and counts only, never their values. Safe to screenshot for an administrator.</p>
+        <p id="diag-loading" class="muted" hidden>Loading…</p>
+        <p id="diag-error" class="form-error" role="alert" hidden></p>
+        <dl id="diag-list" class="kv"></dl>
+      </div>
+    </div>
+  </div>
+</main>
+</body>
+</html>

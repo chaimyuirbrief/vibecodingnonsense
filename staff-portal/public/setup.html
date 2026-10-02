@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Set up the portal</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/setup.js"></script>
+</head>
+<body data-page="setup">
+<a class="skip-link" href="#main">Skip to the form</a>
+<main id="main" class="auth">
+  <div class="card auth-card auth-wide">
+    <header class="auth-head">
+      <p class="auth-org">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <path d="M12 3l7 3v5.5c0 4.6-3 8-7 9.5-4-1.5-7-4.9-7-9.5V6z"></path>
+            <path d="M9 12l2 2 4-4"></path>
+          </svg>
+        </span>
+        <span id="org-name">Staff portal</span>
+      </p>
+      <h1 id="title">Set up the portal</h1>
+      <p class="muted">Create the first account. It becomes the Super Admin, this network is trusted, and this browser is approved.</p>
+    </header>
+
+    <div id="status-error" class="banner banner-warn" role="alert" hidden></div>
+
+    <section id="pane-form" aria-labelledby="title">
+      <form id="form-setup" novalidate>
+        <div class="field">
+          <label for="setup_key">Setup key</label>
+          <input id="setup_key" name="setup_key" type="password" autocomplete="off" spellcheck="false" required aria-describedby="setup_key-hint">
+          <p id="setup_key-hint" class="hint">The <code>SETUP_KEY</code> secret you set when deploying. It works once, for 10 minutes after the first try.</p>
+          <p id="setup_key-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="full_name">Your full name</label>
+          <input id="full_name" name="full_name" type="text" autocomplete="name" required>
+          <p id="full_name-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="email">Work email</label>
+          <input id="email" name="email" type="email" autocomplete="email" autocapitalize="none" spellcheck="false" required>
+          <p id="email-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required aria-describedby="password-hint">
+          <meter id="password-meter" class="password-meter" min="0" max="4" low="2" high="3" optimum="4" value="0" aria-label="Password strength"></meter>
+          <p id="password-hint" class="hint" aria-live="polite">Use at least 12 characters. A few unrelated words works well.</p>
+          <p id="password-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="confirm">Confirm password</label>
+          <input id="confirm" name="confirm" type="password" autocomplete="new-password" required>
+          <p id="confirm-error" class="field-error" hidden></p>
+        </div>
+        <p id="setup-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="setup-submit" class="btn btn-primary btn-block" type="submit">Create the Super Admin</button>
+        </div>
+        <p class="hint">Next you’ll add a passkey or an authenticator app — the Super Admin account always needs one.</p>
+      </form>
+    </section>
+
+    <section id="pane-done" aria-labelledby="done-heading" hidden>
+      <div class="banner banner-info">
+        <div class="banner-body">
+          <p id="done-heading" class="banner-title">This portal is already set up</p>
+          <p>Setup runs once. Sign in with your account, or ask an administrator for an invitation.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <a class="btn btn-primary btn-block" href="/login">Go to sign in</a>
+      </div>
+    </section>
+
+    <section id="pane-cookie" aria-labelledby="cookie-heading" hidden>
+      <div class="banner banner-danger">
+        <div class="banner-body">
+          <p id="cookie-heading" class="banner-title">Your browser didn’t keep the sign-in</p>
+          <p>The account was created, but this browser refused the sign-in cookie. This usually happens in a private window, with cookies blocked for this site, or in an app’s built-in browser. Allow cookies for this site and sign in with the email and password you just chose.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <a class="btn btn-secondary btn-block" href="/login">Go to sign in</a>
+      </div>
+    </section>
+  </div>
+</main>
+</body>
+</html>

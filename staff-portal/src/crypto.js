@@ -1,8 +1,11 @@
 // Password hashing, HMAC signing, at-rest encryption. WebCrypto only.
 //
 // Two secrets, deliberately separate (SPEC §11 "Rotating the server secret"):
-//   SESSION_SECRET  signs device cookies, MFA tokens and fingerprint cookies.
-//                   Rotating it signs everyone out — annoying, recoverable.
+//   SESSION_SECRET  signs device cookies, MFA tokens, fingerprint and pass
+//                   cookies. Rotating it makes every device read as new (re-
+//                   approve them; grace windows lapse) and voids sign-ins in
+//                   flight — annoying, recoverable. Sessions survive: they are
+//                   random tokens stored as hashes, not signed values.
 //   DATA_KEY        derives the AES-GCM key for secrets stored at rest (TOTP).
 //                   Rotating it without re-encrypting kills every
 //                   authenticator app, so it is never the same secret.

@@ -386,9 +386,10 @@ assertCanGrantPerms(actorAuthz, perms[]) → void | throws
     // every key in the catalogue, none reserved, every one held by the actor
 assertNotLastSuper(env, targetUserId, nowMs) → void | throws GuardError('last_superuser')
     // call BEFORE any change that could make the target not an active Super Admin.
-    // Counts active super admins (role or unexpired temp role); refuses if the
-    // target is one and the count is ≤ 1. Fails CLOSED: if the count cannot be
-    // read, refuse.
+    // Counts PERMANENT active Super Admins only (role super_admin, or a temp-role
+    // row with NO expiry): a timed grant lapses by itself, so it never counts as
+    // an owner who will remain. Refuses if the target is a permanent one and the
+    // count is ≤ 1. Fails CLOSED: if the count cannot be read, refuse.
 userAuthz(env, userId, nowMs) → authz            // loads the user, then effectivePermissions
 validateRolePermissions(perms) → string[]        // catalogue keys only, no '*', no reserved; throws ValidationError
 ```
@@ -484,7 +485,9 @@ makeProtectedDayFn(cfg) → (rd) => { protected: bool, names: string[] }   // me
 // streak.js
 streakConfig(policy) → cfg     // { enabled, tz, baseHours, graceHours, maxLeewayDays,
                                //   weeklyDays, hebrew, israel, extraDates, leaderboard, isProtected }
-computeDeadline(lastAtMs, cfg) → { deadline, base, leewayDays, graceApplied, blocks: [{ from, to, names }] }
+computeDeadline(lastAtMs, cfg) → { deadline, base, anchor, leewayDays, graceApplied, rounds,
+                                   blocks: [{ from, to, names }],   // leeway runs after the window opened
+                                   opening: { from, to, names } | null }   // the run the sign-in fell inside
     // from/to are 'YYYY-MM-DD'
 streakStatus(row, nowMs, cfg) → status        // PURE — never writes (A §10 "read without rewriting")
 touchStreak(env, userId, nowMs, cfg) → status | null   // NEVER throws; null on any failure
@@ -744,8 +747,14 @@ PASS_COOKIE = '__Host-pass'       // short-lived signed pass after a valid invit
 4. `trusted` = allowlisted IP **or** approved device. `open` = `gate_open`
    active (never in lockdown).
    - `lockdown`: allowlisted IP **and** approved device, else none.
-   - `allowlist`, `invite_only`: trusted or open, else a valid pass cookie →
-     shell `invite`, else none.
+   - `allowlist`: trusted or open → all; else a valid pass cookie → shell
+     `invite`; else none.
+   - `invite_only`: an approved device or open → all; else a valid pass
+     cookie → shell `invite`; else an allowlisted IP → shell `pending` (an
+     unknown device on the office network can ask to be approved, but never
+     sees the sign-in page); else none. Here the network alone admits nobody:
+     you were invited (accepting approves your device) or a device was
+     approved for you.
    - `request_access`: trusted or open → all; else pass → `invite`; else
      shell `request`.
    - `fingerprint_gate`: trusted or a valid fp cookie under the threshold →
@@ -761,7 +770,7 @@ Shell path sets (GET unless noted). Every shell also allows `/healthz`,
 |---|---|---|---|
 | setup | `/`, `/setup` | `/js/setup.js` | `GET /api/setup/status`, `POST /api/setup` |
 | request | `/`, `/request-access` | `/js/request.js`, `/js/fp.js` | `POST /api/access-request`, `POST /api/fp` |
-| login | `/`, `/login` | `/js/login.js`, `/js/fp.js`, `/js/webauthn.js` | `POST /api/fp`, `GET /api/auth/whoami` |
+| login | `/`, `/login` | `/js/login.js`, `/js/fp.js`, `/js/webauthn.js` | `POST /api/fp`, `GET /api/auth/whoami`, `POST /api/auth/login` (answers `403 { fingerprint_required: true }` until a fingerprint is on file), `POST /api/auth/mfa/*` |
 | invite | `/invite` | `/js/invite.js`, `/js/fp.js` | `GET /api/invite/:token`, `POST /api/invite/accept`, `POST /api/fp` |
 | pending | any navigation shows `/pending` | `/js/pending.js` | `GET /api/device/status`, `GET /api/diag` |
 
@@ -851,7 +860,7 @@ direct requests for `*.html` paths are 404.
 | method path | auth | body → response |
 |---|---|---|
 | GET /api/setup/status | none | → `{ needed: bool, org_name }` (setup shell only) |
-| POST /api/setup | none | `{ setup_key, email, full_name, password }` → completeSignIn response. Key compared in constant time; setup_ip limit; one-shot claim row in `meta` that **expires after 10 minutes** (B trap 3); creates the Super Admin, allowlists the caller's IP as tier 1 (`/32` or `/128`), approves the device, signs in pinned to `mfa_enroll`. Afterwards the route is unreachable. |
+| POST /api/setup | none | `{ setup_key, email, full_name, password }` → completeSignIn response. Key compared in constant time; setup_ip limit; one-shot claim row in `meta` that **expires after 10 minutes** (B trap 3); creates the Super Admin (`users.createOwner`), allowlists the caller's IP as tier 1 (`/32` or `/128`) — **skipped with a notice when the address is private/reserved** (e.g. `wrangler dev` reports loopback), since the approved device is then the way back in — approves the device, signs in pinned to `mfa_enroll`. Afterwards the route is unreachable. |
 | GET /api/invite/:token | none | → `{ email, full_name, org_name, expires_at }` or 404; invite_ip limit |
 | POST /api/invite/accept | none | `{ token, password, full_name? }` → completeSignIn response |
 | POST /api/access-request | none | `{ email, full_name, reason }` → `{ ok: true }` (identical whether or not the email is known) |
@@ -879,10 +888,10 @@ charges `mfa_user` before verifying.
 
 | method path | auth | notes |
 |---|---|---|
-| GET /api/me | pinned | `{ user, permissions: [...], sources, pinned, enroll_prompt, step_up_fresh, factors: userFactors, org_name, timezone, privacy_notice }` |
+| GET /api/me | pinned | `{ user, permissions: [...], sources, pinned, enroll_prompt, step_up_fresh, factors: userFactors, passkeys: [{ id, label, created_at, last_used_at }], org_name, timezone, privacy_notice }` |
 | PATCH /api/me | session | `{ full_name }` |
 | POST /api/me/password | pinned | `{ current, next }` |
-| GET /api/me/streak | session | `{ enabled, status, history, upcoming, rules, leaderboard: [...] \| null }` |
+| GET /api/me/streak | session | `{ enabled, status, history, upcoming, rules, leaderboard: [...] \| null }` — leaderboard per `streak_leaderboard`: `all` → everyone signed in; `managers` → only holders of `team.view` or `streaks.view_all`; `off` → null |
 | GET /api/me/sessions | session | list; DELETE /api/me/sessions/:ref; POST /api/me/sessions/revoke-others |
 | GET /api/me/devices | session | devices this user signed in on; DELETE /api/me/devices/:id (forget: revoke grace + sessions there) |
 | POST /api/me/devices/approve | session + step-up | `{ code }` — approve a pending device for yourself; only from an **approved** current device; device_code_user limit |
@@ -906,7 +915,7 @@ charges `mfa_user` before verifying.
 | GET /api/admin/overview | any admin-console perm — counts the caller may see |
 | GET /api/directory | directory.view |
 | GET /api/admin/users · GET /api/admin/users/:id | users.view (or team.view for own reports) |
-| POST /api/admin/users | users.invite — `{ email, full_name, role_id, ... }` → `{ user, invitation: { url, expires_at } }` |
+| POST /api/admin/users | users.invite — `{ email, full_name, role_id?, ... }` → `{ user, invitation: { url, expires_at }, emailed }`; a missing `role_id` means the `employee` role (a manager cannot list roles) |
 | PATCH /api/admin/users/:id | users.edit |
 | POST /api/admin/users/:id/status | users.suspend (`active`↔`suspended`) / users.disable (`disabled`↔`active`) |
 | POST /api/admin/users/:id/role | users.roles — `{ role_id, perm_grants, perm_denies }` |
@@ -922,7 +931,7 @@ charges `mfa_user` before verifying.
 | GET /api/admin/requests · POST …/:id/approve `{ role_id }` · POST …/:id/deny | requests.manage |
 | GET /api/admin/roles · GET /api/admin/permissions | roles.view |
 | POST /api/admin/roles · PATCH /api/admin/roles/:id · DELETE /api/admin/roles/:id | roles.manage (reserved) |
-| GET /api/admin/devices · POST …/:id/approve · …/:id/block · …/:id/unblock · …/:id/rename · DELETE …/:id | devices.view / devices.approve / devices.manage |
+| GET /api/admin/devices · POST …/:id/approve · …/:id/block · …/:id/unblock · …/:id/rename · DELETE …/:id | devices.view / devices.approve / devices.manage (the console approves by typed code by matching the pending list, then posting `{ code }` to …/:id/approve) |
 | GET /api/admin/sessions · DELETE /api/admin/sessions/:ref | sessions.view / sessions.revoke |
 | GET /api/admin/streaks | streaks.view_all (all) or team.view (own reports) |
 | GET /api/admin/audit | audit.view — `?action=&actor=&target_type=&target_id=&outcome=&severity=&q=&before_seq=&limit=` → `{ entries, next_before_seq }`; each entry has `revertible`, `reverted_by` — **never** `undo_payload` |
@@ -980,8 +989,12 @@ Inputs: `lastAt` (ms of the most recent sign-in), `cfg` (§7.4).
 
 ```
 lastDay  = localDay(lastAt)
-base     = lastAt + baseHours·H
-hardCap  = base + maxLeewayDays·D + graceHours·H      // a calendar bug can never exceed this
+anchor   = lastAt
+if maxLeewayDays > 0 and isProtected(lastDay):        // signed in DURING a protected block:
+    end    = the last day of that run (at most maxLeewayDays days long)   // the clock does not run
+    anchor = zonedMidnightUtc(end + 1);  lastDay = end                    // in protected time (B)
+base     = anchor + baseHours·H
+hardCap  = lastAt + baseHours·H + maxLeewayDays·D + graceHours·H   // a calendar bug can never exceed this
 deadline = base
 repeat at most 8 rounds:
     endDay  = localDay(deadline)
@@ -999,8 +1012,15 @@ repeat at most 8 rounds:
 Worked values with the defaults (30h window, 12h re-entry grace, Shabbos +
 diaspora Yom Tov): a regular day 30h; across Shabbos 54h; a two-day Yom Tov
 78h; Yom Tov Thursday–Friday into Shabbos 102h (A's table). Re-entry grace
-only ever lengthens a window: signing in at 11pm Friday gives until noon
-Sunday, not 5am.
+only ever lengthens a window: signing in at 11pm **Thursday** gives until noon
+Sunday rather than 5am (11pm Friday already reaches 5am Monday through the
+leeway day). Signing in on Saturday night opens the window at midnight, when
+Shabbos ends in the day model: 9pm Saturday → 6am Monday.
+
+**Invariant (tested every 30 minutes over two years):** a later sign-in never
+produces an earlier deadline. Without the anchor rule a sign-in early on
+Shabbos did exactly that (Fri 11:30pm → Mon 5:30am, then Sat 12:10am → Sun
+6:10am).
 
 `touchStreak(env, userId, nowMs, cfg)` — called by `completeSignIn` only:
 

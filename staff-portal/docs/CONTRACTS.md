@@ -870,7 +870,7 @@ direct requests for `*.html` paths are 404.
 | POST /api/auth/mfa/passkey/options | none | `{ token }` → assertion options |
 | POST /api/auth/mfa/passkey/verify | none | `{ token, credential }` → completeSignIn |
 | POST /api/auth/logout | pinned | → `{ ok: true }`; clears the session cookie |
-| GET /api/auth/whoami | none | → `{ authenticated: bool, user?, pinned?, enroll_prompt? }` |
+| GET /api/auth/whoami | none | → `{ authenticated: bool, user?, pinned?, enroll_prompt?, org_name, privacy_notice: string \| null }` — the login page's source for the org name and the fingerprinting notice |
 
 Every factor endpoint re-checks `status === 'active'` and lockdown, and
 charges `mfa_user` before verifying.
@@ -1129,6 +1129,9 @@ chars and arrays at 64 items, and rejects a body over 16 KiB.
   `cf` (one Client = one browser).
 - `tests/helpers/authenticator.js` → software passkeys (webauthn work).
 - `tests/helpers/dom.js` → minimal DOM stub for page scripts (ui work, A §13.4).
+- Client IPs in tests must look public (e.g. `81.2.69.0/24`, `91.198.174.0/24`,
+  `185.15.56.0/24`): documentation ranges such as `203.0.113.0/24` are
+  *reserved* and the allowlist rightly refuses them.
 - Assert on **absence** as well as presence (no text was sent; no key material
   in a payload; exactly one new audit row) — A §13.8.
 - Every module reachable from unauthenticated input is tested against

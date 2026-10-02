@@ -15,7 +15,7 @@ export const SAFARI_IOS_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1';
 
 export class Client {
-  constructor(worker, env, { ip = '203.0.113.10', ua = CHROME_UA, cf = {}, headers = {} } = {}) {
+  constructor(worker, env, { ip = '81.2.69.142', ua = CHROME_UA, cf = {}, headers = {} } = {}) {
     this.worker = worker;
     this.env = env;
     this.ip = ip;

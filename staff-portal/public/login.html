@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Sign in</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/login.js"></script>
+</head>
+<body data-page="login">
+<a class="skip-link" href="#main">Skip to sign in</a>
+<main id="main" class="auth">
+  <div class="card auth-card">
+    <header class="auth-head">
+      <p class="auth-org">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="flame" viewBox="0 0 24 24" width="20" height="20" focusable="false">
+            <defs>
+              <linearGradient id="brand-flame" x1="0" y1="1" x2="0" y2="0">
+                <stop offset="0" class="flame-stop-3"></stop>
+                <stop offset="0.55" class="flame-stop-2"></stop>
+                <stop offset="1" class="flame-stop-1"></stop>
+              </linearGradient>
+            </defs>
+            <path fill="url(#brand-flame)" d="M12 2.5c.6 3.1 2.9 4.9 4.6 7 1.4 1.7 2.4 3.6 2.4 5.9A7 7 0 0 1 5 15.4c0-2.6 1.3-4.6 3-6.1.2 1.6.9 2.9 2.2 3.6-.4-3.9.3-7.4 1.8-10.4z"></path>
+            <path class="flame-core" d="M12 21a3.6 3.6 0 0 1-3.6-3.6c0-1.9 1.2-3.1 2.4-4.3.3 1 .9 1.7 1.8 2 .1-1.5.5-2.6 1.3-3.6 1.1 1.6 1.7 3.4 1.7 5.6A3.6 3.6 0 0 1 12 21z"></path>
+          </svg>
+        </span>
+        <span id="org-name">Staff portal</span>
+      </p>
+      <h1 id="title" tabindex="-1">Sign in</h1>
+      <p id="subtitle" class="muted">Use your work email or username.</p>
+    </header>
+
+    <p id="status" class="sr-only" role="status" aria-live="polite"></p>
+
+    <!-- Step 1: password -->
+    <section id="pane-password" aria-labelledby="title">
+      <form id="form-password" method="post" novalidate>
+        <div class="field">
+          <label for="identifier">Email or username</label>
+          <input id="identifier" name="identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <p id="password-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="password-submit" class="btn btn-primary btn-block" type="submit">Continue</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Step 2a: two or more methods this browser can offer -->
+    <section id="pane-choose" aria-labelledby="choose-heading" hidden>
+      <p id="choose-heading" class="muted">Choose how to confirm it’s you. The first option is the strongest.</p>
+      <ul id="choices" class="choices"></ul>
+      <p id="choose-error" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <!-- Step 2b: authenticator app or backup code (one box, A §7.3) -->
+    <section id="pane-code" aria-labelledby="code-label" hidden>
+      <form id="form-code" method="post" novalidate>
+        <div class="field">
+          <label id="code-label" for="code">Code from your authenticator app</label>
+          <input id="code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="32" placeholder="123456" required>
+          <p id="code-hint" class="hint">Open your authenticator app and enter the 6-digit code for this portal.</p>
+        </div>
+        <p id="code-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="code-submit" class="btn btn-primary btn-block" type="submit">Confirm</button>
+          <button id="code-toggle" class="btn btn-link" type="button">Use a backup code instead</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Step 2c: a code we sent by text or email -->
+    <section id="pane-otp" aria-labelledby="otp-label" hidden>
+      <form id="form-otp" method="post" novalidate>
+        <p id="otp-sent" class="banner banner-info" aria-live="polite"></p>
+        <div class="field">
+          <label id="otp-label" for="otp">Code</label>
+          <input id="otp" name="otp" class="code-input" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="12" placeholder="123456" required>
+          <p class="hint">The code works for 10 minutes.</p>
+        </div>
+        <p id="otp-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="otp-submit" class="btn btn-primary btn-block" type="submit">Confirm</button>
+          <button id="otp-resend" class="btn btn-link" type="button" hidden>Send a new code</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Step 2d: passkey -->
+    <section id="pane-passkey" aria-labelledby="passkey-text" hidden>
+      <p id="passkey-text" class="muted">Use the passkey saved on this device or a security key — your browser will ask for your fingerprint, face, screen lock or key.</p>
+      <p id="passkey-error" class="form-error" role="alert" hidden></p>
+      <div class="form-actions">
+        <button id="passkey-go" class="btn btn-primary btn-block" type="button">Use passkey</button>
+      </div>
+    </section>
+
+    <!-- Step 2e: the dead end, explained (A §7.6) — never an empty list -->
+    <section id="pane-none" aria-labelledby="none-heading" hidden>
+      <div class="banner banner-warn">
+        <div class="banner-body">
+          <p id="none-heading" class="banner-title">This browser can’t confirm it’s you</p>
+          <p id="none-detail"></p>
+          <p id="none-advice"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- After success: the browser did not keep the cookie (A §5) -->
+    <section id="pane-cookie" aria-labelledby="cookie-heading" hidden>
+      <div class="banner banner-danger">
+        <div class="banner-body">
+          <p id="cookie-heading" class="banner-title">Your browser didn’t keep the sign-in</p>
+          <p>Your password and code were accepted, but this browser refused the sign-in cookie, so the portal can’t tell it’s you on the next page.</p>
+          <p>This usually happens in a private or incognito window, when cookies are blocked for this site, or inside an app’s built-in browser. Allow cookies for this site, or open it in your regular browser, then sign in again.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button id="cookie-retry" class="btn btn-secondary btn-block" type="button">Try again</button>
+      </div>
+    </section>
+
+    <!-- After success: nothing enrolled yet — a prompt, never a wall (A §7.5) -->
+    <section id="pane-enroll" aria-labelledby="enroll-heading" hidden>
+      <div class="banner banner-info">
+        <div class="banner-body">
+          <p id="enroll-heading" class="banner-title">Protect your account with a second step</p>
+          <p>You’re signed in. Add a passkey or an authenticator app so a stolen password alone can’t get into your account. It takes about a minute.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <a id="enroll-setup" class="btn btn-primary btn-block" href="/account">Set it up now</a>
+        <a id="enroll-skip" class="btn btn-ghost btn-block" href="/">Not now</a>
+      </div>
+    </section>
+
+    <div id="mfa-footer" class="auth-foot" hidden>
+      <button id="other-method" class="btn btn-ghost btn-sm" type="button" hidden>Use a different method</button>
+      <button id="start-over" class="btn btn-ghost btn-sm" type="button">Start over</button>
+    </div>
+
+    <p id="privacy" class="privacy-note" hidden></p>
+  </div>
+  <p class="auth-below">Forgotten your password or lost your phone? Ask an administrator — they can reset it.</p>
+</main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

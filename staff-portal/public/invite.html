@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Accept your invitation</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/invite.js"></script>
+</head>
+<body data-page="invite">
+<a class="skip-link" href="#main">Skip to the form</a>
+<main id="main" class="auth">
+  <div class="card auth-card">
+    <header class="auth-head">
+      <p class="auth-org">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <rect x="3" y="5.5" width="18" height="13" rx="2"></rect>
+            <path d="M3.5 7l8.5 6 8.5-6"></path>
+          </svg>
+        </span>
+        <span id="org-name">Staff portal</span>
+      </p>
+      <h1 id="title">You’re invited</h1>
+    </header>
+
+    <section id="pane-loading" aria-label="Checking your invitation">
+      <p class="muted" role="status">Checking your invitation…</p>
+      <div class="skeleton" aria-hidden="true">
+        <span class="skeleton-line"></span>
+        <span class="skeleton-line"></span>
+        <span class="skeleton-line"></span>
+      </div>
+    </section>
+
+    <section id="pane-invalid" aria-labelledby="invalid-heading" hidden>
+      <div class="banner banner-warn">
+        <div class="banner-body">
+          <p id="invalid-heading" class="banner-title">This invitation link doesn’t work</p>
+          <p id="invalid-detail">It may have expired, been used already, or been replaced by a newer one.</p>
+          <p>Ask the person who invited you to send a new link. Invitations last 7 days.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="pane-form" class="stack" aria-labelledby="title" hidden>
+      <p class="lead">Set a password to finish creating your <span id="invite-org-line" hidden><strong id="invite-org"></strong> </span>account.</p>
+      <dl class="kv kv-box">
+        <dt>Email</dt>
+        <dd id="invite-email" class="mono"></dd>
+        <dt>Link expires</dt>
+        <dd id="invite-expires"></dd>
+      </dl>
+      <form id="form-invite" method="post" novalidate>
+        <div class="field">
+          <label for="full_name">Your full name</label>
+          <input id="full_name" name="full_name" type="text" autocomplete="name" required>
+          <p id="full_name-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="password">Choose a password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required aria-describedby="password-hint">
+          <meter id="password-meter" class="password-meter" min="0" max="4" low="2" high="3" optimum="4" value="0" aria-label="Password strength"></meter>
+          <p id="password-hint" class="hint" aria-live="polite">Use at least 12 characters. A few unrelated words works well.</p>
+          <p id="password-error" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="confirm">Confirm password</label>
+          <input id="confirm" name="confirm" type="password" autocomplete="new-password" required>
+          <p id="confirm-error" class="field-error" hidden></p>
+        </div>
+        <p id="invite-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="invite-submit" class="btn btn-primary btn-block" type="submit">Create my account</button>
+        </div>
+        <p class="hint">Accepting approves this browser for your account.</p>
+      </form>
+    </section>
+
+    <section id="pane-cookie" aria-labelledby="cookie-heading" hidden>
+      <div class="banner banner-danger">
+        <div class="banner-body">
+          <p id="cookie-heading" class="banner-title">Your browser didn’t keep the sign-in</p>
+          <p>Your account is ready, but this browser refused the sign-in cookie. This usually happens in a private window, with cookies blocked for this site, or in an app’s built-in browser. Allow cookies for this site, then sign in with your email and new password.</p>
+        </div>
+      </div>
+      <div class="form-actions">
+        <a class="btn btn-secondary btn-block" href="/login">Go to sign in</a>
+      </div>
+    </section>
+
+    <p id="privacy" class="privacy-note">
+      <svg class="icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5M12 7.5v.5"></path></svg>
+      <span id="privacy-text">To keep staff accounts safe, this portal records technical details of each visit: your IP address and approximate location, and characteristics of your device and browser.</span>
+    </p>
+  </div>
+</main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

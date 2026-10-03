@@ -1,0 +1,22 @@
+{
+  "name": "staff-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Staff identity, access, audit and streak dashboard on Cloudflare Workers + D1. Zero runtime dependencies.",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run.mjs",
+    "check": "node scripts/bundle-check.mjs",
+    "dev": "wrangler dev",
+    "dry-run": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "jsqr": "^1.4.0",
+    "wrangler": "^4.147.0"
+  }
+}

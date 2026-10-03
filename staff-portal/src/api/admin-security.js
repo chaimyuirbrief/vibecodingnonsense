@@ -307,7 +307,7 @@ async function postBlock(rc) {
   const input = isPlainObject(b) && b.reason === undefined && b.label !== undefined ? { ...b, reason: b.label } : b;
   const cidr = validateCidr(input.cidr, { what: 'blocklist' });
   return writing(rc, 'network.block.add', null, async () => {
-    assertCanBlock(rc, cidr);
+    await assertCanBlock(rc, cidr);
     const row = await addBlocked(rc, input);
     await audit(rc, {
       action: 'network.block.add',

@@ -67,8 +67,16 @@ function assertHero(page, s, state) {
   assert.equal(chip.textContent, String(shown));
 }
 
-// The 84-cell strip against `history`.
+// The person's first day in the portal zone, from what GET /api/me sent.
+function joinedDay(page) {
+  const me = page.requests('/api/me', 'GET').find((x) => x.path === '/api/me').response;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: me.timezone }).format(new Date(me.user.created_at));
+}
+
+// The 84-cell strip against `history`. Days before the person joined were
+// never theirs to miss (STREAK-5).
 function assertStrip(page, history) {
+  const joined = joinedDay(page);
   const cells = page.document.querySelectorAll('#strip .strip-day');
   assert.equal(cells.length, 84, '12 weeks × 7 days');
   assert.equal(history.length, 84, 'the API sends 84 days');
@@ -84,11 +92,14 @@ function assertStrip(page, history) {
     }
     const e = byDay.get(day);
     assert.ok(e, `${day} is in the API history`);
+    const before = day < joined && !e.counted && !e.today;
     assert.equal(cls.contains('is-counted'), e.counted, `${day} counted`);
-    assert.equal(cls.contains('is-protected'), e.protected, `${day} protected`);
+    assert.equal(cls.contains('is-before'), before, `${day} before they joined`);
+    assert.equal(cls.contains('is-protected'), e.protected && !before, `${day} protected`);
     assert.equal(cls.contains('is-today'), e.today, `${day} today`);
-    assert.equal(cls.contains('is-missed'), !e.counted && !e.protected && !e.today, `${day} missed`);
-    if (e.protected && e.names.length) assert.ok(cell.getAttribute('aria-label').includes(e.names.join(', ')), `${day} names its protection`);
+    assert.equal(cls.contains('is-missed'), !before && !e.counted && !e.protected && !e.today, `${day} missed`);
+    if (before) assert.match(cell.getAttribute('aria-label'), /: before you joined$/, day);
+    else if (e.protected && e.names.length) assert.ok(cell.getAttribute('aria-label').includes(e.names.join(', ')), `${day} names its protection`);
     checked++;
   }
   assert.ok(checked >= 78, 'nearly every cell is a past day from the API');
@@ -125,7 +136,7 @@ test('none: no streak row → "No streak yet", 0, an empty strip, the rules and 
   assertHero(page, status, 'none');
   assertStrip(page, streak.history);
   assert.deepEqual(counted(page), []);
-  assert.equal(page.text('strip-summary').startsWith('Signed in on 0 of the last'), true);
+  assert.equal(page.text('strip-summary'), 'No open days to count yet.', 'joined today, nothing counted yet: nothing missed either');
   assertUpcoming(page, streak.upcoming);
   assert.deepEqual(streak.upcoming.map((e) => e.day), ['2026-01-10', '2026-01-17', '2026-01-24']);
   assert.equal(page.document.querySelectorAll('#upcoming li')[0].textContent.replace(/\s+/g, ' ').trim(), 'Sat Jan 10 · Shabbos — the clock pauses');
@@ -154,8 +165,8 @@ test('active: consecutive days then across Shabbos — count, words, strip and c
   const sat = page.document.querySelector('#strip .strip-day[data-day="2026-01-10"]');
   assert.ok(sat.classList.contains('is-protected') && !sat.classList.contains('is-counted'));
   assert.equal(sat.getAttribute('aria-label'), 'Sat Jan 10: protected (Shabbos)');
-  assert.equal(page.text('strip-summary'), page.module.stripSummary(page.module.buildStrip(streak.history)));
-  assert.match(page.text('strip-summary'), /^Signed in on 5 of the last \d+ open days\. \d+ protected days didn’t count against you\.$/);
+  assert.equal(page.text('strip-summary'), page.module.stripSummary(page.module.buildStrip(streak.history, { since: joinedDay(page) })));
+  assert.equal(page.text('strip-summary'), 'Signed in on 5 of the last 5 open days. 1 protected day didn’t count against you.', 'joined Tue Jan 6: the days before it are not open days');
   assertUpcoming(page, streak.upcoming);
   assert.deepEqual(streak.upcoming.map((e) => e.day), ['2026-01-17', '2026-01-24', '2026-01-31']);
   // Leaderboard (setting 'all'): this person, marked as you.
@@ -247,6 +258,41 @@ test('at risk, lapsed, then a skipped day restarts at 1 with the longest kept', 
   assert.ok(fri.classList.contains('is-missed'), 'Friday shows as missed');
   assert.equal(fri.getAttribute('aria-label'), 'Fri Jan 9: missed');
   v.page.dispose();
+});
+
+test('a brand-new account: the days before it existed are "before you joined", never "missed" (STREAK-5)', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  const u = await makeUser(env, owner.client, { email: 'nia@acme.com', full_name: 'Nia New' }); // created and signed in Tue Jan 6
+  let { page, streak } = await openDashboard(u.client);
+  assert.equal(joinedDay(page), '2026-01-06');
+  assertStrip(page, streak.history);
+  assert.deepEqual(page.document.querySelectorAll('#strip .strip-day.is-missed').map((c) => c.dataset.day), [], 'nothing missed on day one');
+  const before = page.document.querySelectorAll('#strip .strip-day.is-before');
+  assert.equal(before.length, page.document.querySelectorAll('#strip .strip-day').filter((c) => c.dataset.day < '2026-01-06').length, 'every earlier day on the strip');
+  assert.ok(before.length > 60);
+  assert.equal(before[0].getAttribute('aria-label'), 'Sun Oct 19: before you joined');
+  assert.equal(before[0].querySelector('svg'), null, 'no protected glyph on a Shabbos before they joined');
+  assert.ok(page.visible('legend-before'), 'the legend explains the empty squares');
+  assert.equal(page.text('strip-summary'), 'Signed in on 1 of the last 1 open day.');
+  page.dispose();
+
+  // Someone who has been here all along sees no "before" squares.
+  q(env, "UPDATE users SET created_at = '2025-06-02T14:00:00.000Z' WHERE id = ?", owner.client.user.id);
+  const old = await openDashboard(owner.client);
+  assertStrip(old.page, old.streak.history);
+  assert.equal(old.page.document.querySelectorAll('#strip .strip-day.is-before').length, 0);
+  assert.ok(!old.page.visible('legend-before'));
+  assert.ok(old.page.document.querySelectorAll('#strip .strip-day.is-missed').length > 60, 'their unsigned days are missed days');
+  old.page.dispose();
+
+  // A day skipped after joining is still a missed day.
+  await signInAt(env, u, ny(8, 9));
+  ({ page, streak } = await openDashboard(u.client));
+  assertStrip(page, streak.history);
+  assert.deepEqual(page.document.querySelectorAll('#strip .strip-day.is-missed').map((c) => c.dataset.day), ['2026-01-07']);
+  assert.equal(page.text('strip-summary'), 'Signed in on 2 of the last 3 open days.');
+  page.dispose();
 });
 
 test('streaks off: the hero says so and the streak cards hide', async () => {

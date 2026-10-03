@@ -3,7 +3,8 @@
 // verifies, and a tampered row is named exactly.
 
 import { test, assert, run } from '../helpers/t.js';
-import { freshEnv, bootstrap, makeUser, stepUp, q, count, auditRows, fakeProvider, sessionToken, deviceCookie } from '../helpers/flows.js';
+import { freshEnv, bootstrap, makeUser, stepUp, client, setSetting, q, count, auditRows, fakeProvider, sessionToken, deviceCookie } from '../helpers/flows.js';
+import { verifyChain } from '../../src/audit.js';
 
 async function world() {
   const mail = fakeProvider();
@@ -139,6 +140,30 @@ test('filters: blank means unfiltered, a value that cannot be valid matches noth
   const reverted = (await c.get('/api/admin/audit?action=network.allow.add')).body.entries.find((e) => e.reverted_by !== null);
   assert.ok(reverted, 'the reverted entry says by whom');
   assert.equal(reverted.revertible, false);
+});
+
+
+// AUTHZ-3, SPEC §11: every meaningful action writes a row, and the loser of a
+// race retries. A burst of strangers' rows must never make an administrator's
+// change commit with no row behind it.
+test('a privileged change racing a flood of strangers’ requests always has its audit row', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  setSetting(env, 'access_mode', 'request_access');
+  const victims = [];
+  for (let i = 0; i < 4; i++) victims.push(await makeUser(env, owner.client, { role: 'employee' }));
+  let sent = 0;
+  for (const v of victims) {
+    await stepUp(env, owner.client);
+    const flood = Array.from({ length: 80 }, (_, i) => client(env).post('/api/access-request', { email: `n${v.user.id}-${i}@x.example`, full_name: 'N' }));
+    sent += flood.length;
+    const [r] = await Promise.all([owner.client.post(`/api/admin/users/${v.user.id}/status`, { status: 'suspended' }), ...flood]);
+    assert.equal(r.status, 200, r.text);
+    assert.equal(q(env, 'SELECT status FROM users WHERE id = ?', v.user.id)[0].status, 'suspended');
+    assert.equal(count(env, "SELECT COUNT(*) FROM audit_log WHERE action = 'user.status' AND target_id = ?", String(v.user.id)), 1, 'the suspension has its row');
+  }
+  assert.equal(count(env, "SELECT COUNT(*) FROM audit_log WHERE action = 'request.create'"), sent, 'and so does every request');
+  assert.equal((await verifyChain(env)).ok, true);
 });
 
 await run();

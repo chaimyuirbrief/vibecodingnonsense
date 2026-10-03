@@ -24,7 +24,7 @@ import { setDeviceStatus, renameDevice } from './devices.js';
 import { addAllowed, editAllowed, removeAllowed, addBlocked, removeBlocked } from './network.js';
 import { restoreFactors } from './mfa/factors.js';
 import { addDestination, removeDestination, destinationHint } from './mfa/otp.js';
-import { restoreStreak } from './streak.js';
+import { restoreStreak, STREAK_FIELDS } from './streak.js';
 import { checkSettings, approveCallerDevice, assertCanRemoveAllowed, assertCanEditAllowed, assertCanBlock } from './guards.js';
 import { assertActOnUser, editRole, deleteRole, recreateRole } from './api/admin.js';
 
@@ -121,12 +121,15 @@ export const REVERTERS = Object.freeze({
 
   // ------------------------------------------------------------ devices
 
-  // setDeviceStatus refuses to block, or with gating on un-approve, the
-  // device the reverter is using (B trap 8).
+  // setDeviceStatus refuses to block, or un-approve where the gate needs the
+  // approval, the device the reverter is using (B trap 8), and to withdraw
+  // trust from a device someone ranked at or above the reverter signs in on.
   async 'device.status'(rc, payload) {
     const p = obj(payload);
     if (typeof p.status !== 'string' || typeof p.deviceId !== 'string') throw unreadable();
-    await requirePerm(rc, p.status === 'approved' ? 'devices.approve' : 'devices.manage');
+    // Approving a device that is blocked now is lifting the block: devices.manage.
+    const cur = await rc.env.DB.prepare('SELECT status FROM devices WHERE id = ?').bind(str(p.deviceId, 128)).first();
+    await requirePerm(rc, p.status === 'approved' && cur?.status === 'pending' ? 'devices.approve' : 'devices.manage');
     const { row } = await setDeviceStatus(rc, p.deviceId, p.status, {});
     return { detail: `${row.label || 'the device'} is ${row.status} again` };
   },
@@ -204,7 +207,7 @@ export const REVERTERS = Object.freeze({
     const r = obj(obj(payload).row);
     if (typeof r.cidr !== 'string') throw unreadable();
     await requirePerm(rc, 'network.manage');
-    assertCanBlock(rc, r.cidr);
+    await assertCanBlock(rc, r.cidr);
     const row = await addBlocked(rc, { cidr: r.cidr, reason: r.reason ?? null, expires_at: r.expires_at ?? null });
     return { detail: `${row.cidr} is blocked again` };
   },
@@ -293,12 +296,28 @@ export const REVERTERS = Object.freeze({
 
   // ------------------------------------------------------------ streaks
 
-  async streak(rc, payload) {
+  // Only while the row is still exactly what the adjustment wrote: once they
+  // have signed in since, the snapshot would wipe the days they earned
+  // (restoreStreak refuses, 409 changed_since). An entry recorded before the
+  // payload carried `wrote` is compared on what its after-state kept.
+  async streak(rc, payload, entry) {
     const p = obj(payload);
     const { row: user } = await assertActOnUser(rc, id(p.userId), { perm: 'streaks.manage' });
     if (p.prior !== null && p.prior !== undefined) obj(p.prior);
-    await restoreStreak(rc.env, user.id, p.prior ?? null, rc.nowMs);
-    return { detail: p.prior ? `${user.email}’s streak is back to ${p.prior.current} (longest ${p.prior.longest})` : `${user.email} has no streak again` };
+    let expect;
+    if (p.wrote !== undefined) expect = obj(p.wrote);
+    else {
+      const a = entry && entry.after && typeof entry.after === 'object' ? entry.after : null;
+      if (!a || !Number.isInteger(a.current) || !Number.isInteger(a.longest)) throw unreadable();
+      expect = { current: a.current, longest: a.longest };
+    }
+    const { prior: replaced, row } = await restoreStreak(rc.env, user.id, p.prior ?? null, rc.nowMs, { expect });
+    const shape = (r) => (r ? Object.fromEntries(STREAK_FIELDS.map((k) => [k, r[k] ?? null])) : null);
+    return {
+      detail: p.prior ? `${user.email}’s streak is back to ${p.prior.current} (longest ${p.prior.longest})` : `${user.email} has no streak again`,
+      before: shape(replaced),
+      after: shape(row),
+    };
   },
 });
 

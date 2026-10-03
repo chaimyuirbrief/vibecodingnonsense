@@ -5,8 +5,8 @@
 // worker, so a shell that forgot one fails here rather than in production.
 
 import { test, assert, run } from '../helpers/t.js';
-import { openLive, navigate, apiErrors, lastNav, settle } from '../helpers/live.js';
-import { freshEnv, bootstrap, makeUser, client, setSetting, q, count, OWNER_IP, PASSWORD } from '../helpers/flows.js';
+import { openLive, navigate, apiErrors, lastNav, settle, liveFetch } from '../helpers/live.js';
+import { freshEnv, bootstrap, makeUser, client, setSetting, advance, q, count, OWNER_IP, PASSWORD, HOUR } from '../helpers/flows.js';
 
 function noFailures(page, ignore = []) {
   assert.deepEqual(apiErrors(page, { ignore }).map((c) => `${c.method} ${c.url} → ${c.status} ${JSON.stringify(c.response)}`), [], 'a live API call failed');
@@ -215,6 +215,59 @@ test('fingerprint gate: the login shell reports the browser first, then signs in
   home.dispose();
   const risk = q(env, 'SELECT risk FROM fingerprints ORDER BY last_seen DESC LIMIT 1')[0].risk;
   assert.ok(risk < 70, `this browser scores under the threshold (${risk})`);
+});
+
+test('fingerprint gate: a signed-in browser whose fingerprint cookie lapsed is not sent round in a loop — the report lands before the page leaves (FE-1)', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  const u = await makeUser(env, owner.client, { role: 'employee' });
+  setSetting(env, 'session_absolute_hours', '48'); // allowed: 1..72
+  setSetting(env, 'session_idle_minutes', '1440'); // allowed: 5..1440
+  setSetting(env, 'access_mode', 'fingerprint_gate');
+  // A second, unapproved browser of the same person signs in normally.
+  const c = client(env);
+  const fp = await c.post('/api/fp', { signals: { v: 1, ua: c.ua, languages: ['en-US'], tz: 'America/New_York', screen: { w: 1440, h: 900, cd: 24, dpr: 2 } } });
+  assert.equal(fp.status, 200, fp.text);
+  const login = await c.post('/api/auth/login', { identifier: u.user.email, password: PASSWORD });
+  assert.equal(login.status, 200, login.text);
+  assert.equal((await navigate(c, '/')).file, 'dashboard.html');
+  advance(env, 12 * HOUR);
+  assert.equal((await c.get('/api/me')).status, 200);
+  advance(env, 13 * HOUR); // the fingerprint cookie (24 h) lapsed; the session (48 h, 24 h idle) did not
+
+  // The report is held back a while, as the browser probes hold it back
+  // (WebRTC alone may take 800 ms), then really sent to the worker.
+  const base = liveFetch(c);
+  const handler = async (url, init = {}) => {
+    if (String(init.method || 'GET').toUpperCase() === 'POST' && new URL(url, env.ORIGIN).pathname === '/api/fp') await new Promise((r) => setTimeout(r, 300));
+    return base(url, init);
+  };
+  handler.client = c;
+  const page = await openLive(c, '/', { live: handler });
+  assert.equal(page.served.file, 'login.html', 'the login shell serves the sign-in page to the signed-in browser');
+  // Watch (in real time) for the moment the page asks to leave; what a
+  // browser gets for that address THEN is what decides whether it loops.
+  let nav = null;
+  let reportDone = null;
+  let landed = null;
+  for (const t0 = Date.now(); !nav && Date.now() - t0 < 3000; ) {
+    await page.drain(2);
+    nav = lastNav(page);
+    if (!nav) {
+      await new Promise((r) => setTimeout(r, 5));
+      continue;
+    }
+    const report = calls(page, 'POST', '/api/fp');
+    reportDone = report.length > 0 && report.every((r) => r.done);
+    landed = await navigate(c, nav.url);
+  }
+  assert.deepEqual(nav, { type: 'replace', url: '/' });
+  assert.equal(reportDone, true, 'left before the fingerprint report landed');
+  assert.equal(landed.file, 'dashboard.html', 'the address it went to shows the sign-in page again: a reload loop');
+  await settle(page);
+  assert.equal(calls(page, 'POST', '/api/fp')[0].status, 200);
+  noFailures(page);
+  page.dispose();
 });
 
 await run();

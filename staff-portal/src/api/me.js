@@ -362,20 +362,38 @@ async function stepUpPasskeyVerify(rc) {
 
 // ---------------------------------------------------------------- second factors
 
+// Adding a factor to an account that can already prove who it is needs that
+// proof first (SPEC §7.9): otherwise whoever sits at a session whose step-up
+// has gone stale registers a key of their own, steps up with it, and then
+// removes the owner's factors. An account with nothing to prove itself with
+// — a first factor, or a session pinned to enrolment, which cannot reach the
+// step-up routes — enrols on the session alone. → the methods it had.
+async function requireStepUpToEnrol(rc) {
+  const had = await availableMethods(rc.env, rc.user.id);
+  if (had.length > 0 && rc.session.pinned !== 'mfa_enroll') requireStepUp(rc);
+  return had;
+}
+
 async function totpBegin(rc) {
+  await requireStepUpToEnrol(rc);
   const r = await beginTotp(rc, rc.user.id);
   return json(200, { secret_grouped: r.secret_grouped, otpauth: r.otpauth, qr: r.qr });
 }
 
-// Proving a code from the new authenticator is a factor proved now, so it
-// marks step-up too (CONTRACTS §8.4).
+// Proving a code from the new authenticator marks step-up only for an
+// account that had no other way to prove itself (CONTRACTS §8.4): a factor
+// the session just added must never stand in for one the account already had.
 async function totpConfirm(rc) {
+  const had = await requireStepUpToEnrol(rc);
   const b = await body(rc);
   const r = await confirmTotp(rc, rc.user.id, codeInput(b.code) ?? '');
-  await markStepUp(rc.env, rc.session.id, 'totp', rc.nowMs);
-  rc.session.aal = 2;
-  rc.session.mfa_at = iso(rc.nowMs);
-  await audit(rc, { action: 'mfa.totp.enroll', target: me(rc), detail: 'Set up an authenticator app' });
+  if (had.length === 0) {
+    await markStepUp(rc.env, rc.session.id, 'totp', rc.nowMs);
+    rc.session.aal = 2;
+    rc.session.mfa_at = iso(rc.nowMs);
+  }
+  // A new way in is worth noticing in the log, whoever added it.
+  await audit(rc, { action: 'mfa.totp.enroll', target: me(rc), severity: 'notice', detail: 'Set up an authenticator app' });
   if (r.backup_codes) await audit(rc, { action: 'mfa.backup.generate', target: me(rc), detail: `Issued ${r.backup_codes.length} backup codes` });
   return json(200, { backup_codes: r.backup_codes, ...(await repin(rc)) });
 }
@@ -391,15 +409,17 @@ async function totpRemove(rc) {
 }
 
 async function passkeyRegOptions(rc) {
+  await requireStepUpToEnrol(rc);
   return json(200, await registrationOptions(rc, rc.user));
 }
 
 // Registration verifies no signature under attestation 'none', so it is NOT
 // a factor proved and does not mark step-up (A §7.4).
 async function passkeyRegister(rc) {
+  await requireStepUpToEnrol(rc);
   const b = await body(rc);
   const row = await verifyRegistration(rc, rc.user, b.credential, b.label);
-  await audit(rc, { action: 'mfa.passkey.add', target: me(rc), detail: `Added passkey “${row.label || 'unnamed'}”` });
+  await audit(rc, { action: 'mfa.passkey.add', target: me(rc), severity: 'notice', detail: `Added passkey “${row.label || 'unnamed'}”` });
   const backup_codes = await backupCodesIfNone(rc);
   return json(200, { passkey: passkeyView(row), backup_codes, ...(await repin(rc)) });
 }

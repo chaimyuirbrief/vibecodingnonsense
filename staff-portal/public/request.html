@@ -29,7 +29,7 @@
     </header>
 
     <section id="pane-form" aria-labelledby="title">
-      <form id="form-request" novalidate>
+      <form id="form-request" method="post" novalidate>
         <div class="field">
           <label for="full_name">Full name</label>
           <input id="full_name" name="full_name" type="text" autocomplete="name" maxlength="120" required>
@@ -72,5 +72,6 @@
   </div>
   <p class="auth-below">Already have an account? Ask an administrator to approve this browser or this network.</p>
 </main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

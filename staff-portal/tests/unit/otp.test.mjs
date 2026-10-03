@@ -203,17 +203,20 @@ test('sendCode: email goes through Resend with the code in the text, not the sub
   assert.ok(body.subject.includes('Acme Inc.'));
 });
 
-test('sendCode: over otp_send is 429 with NO outbound call; refused sends still count (charged first)', async () => {
+test('sendCode: over otp_send is 429 with NO outbound call; junk sends are charged first', async () => {
   const { env, uid, rc } = await setup();
   const d = await addDestination(rc(), uid, { kind: 'sms', address: '+15550101234' });
   for (let i = 0; i < 5; i++) assert.equal((await sendCode(rc(), uid, d.id)).sent, true);
   await assert.rejects(sendCode(rc(), uid, d.id), (e) => e.status === 429 && e.body.retry_after > 0);
   assert.equal(env.__fetch.calls.length, 5);
   assert.equal(challenges(env).length, 5);
-  // A junk destination id is charged too — and refused.
+  // A junk destination id is charged too — and refused. Once the bucket is
+  // full, further attempts are refused without adding rows (SPEC §16.34).
   const { env: env2, uid: uid2, rc: rc2 } = await setup();
-  for (const v of HOSTILE) await assert.rejects(sendCode(rc2(), uid2, v), (e) => e.status === 404 || e.status === 429, show(v));
-  assert.equal(env2.DB.q("SELECT COUNT(*) AS n FROM auth_attempts WHERE kind = 'otp_send'")[0].n, HOSTILE.length);
+  const seen = [];
+  for (const v of HOSTILE) await assert.rejects(sendCode(rc2(), uid2, v), (e) => seen.push(e.status) && (e.status === 404 || e.status === 429), show(v));
+  assert.deepEqual(seen, [...Array(5).fill(404), ...Array(HOSTILE.length - 5).fill(429)], 'the first five are charged, then the limit holds');
+  assert.equal(env2.DB.q("SELECT COUNT(*) AS n FROM auth_attempts WHERE kind = 'otp_send'")[0].n, 5);
   assert.equal(env2.__fetch.calls.length, 0);
   assert.equal(challenges(env2).length, 0);
 });

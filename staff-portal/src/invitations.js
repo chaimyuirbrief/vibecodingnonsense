@@ -18,6 +18,13 @@ export const INVITE_TTL_MS = 7 * DAY;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const REQUEST_STATUSES = Object.freeze(['pending', 'approved', 'denied']);
 const REASON_MAX = 1000;
+// access_requests is written by strangers, so the write that grows it trims
+// it (SPEC §13.4, §16.34): a request is kept 90 days after it was decided —
+// or, still pending, after it was made (nobody is waiting on it by then; a
+// decision itself is in the audit log) — and never more than the newest
+// 2,000 rows in all.
+const REQUEST_CAP = 2000;
+const REQUEST_MAX_AGE_MS = 90 * DAY;
 
 function finite(n) {
   return typeof n === 'number' && Number.isFinite(n);
@@ -29,6 +36,15 @@ function nowOf(rc) {
 
 function isPlainObject(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+// Tests may LOWER a retention cap with env.__retention (a function, so a
+// wrangler string var can never set it); nothing can raise one.
+function capOf(env, key, def) {
+  const f = env && env.__retention;
+  if (typeof f !== 'function') return def;
+  const n = toInt(f(key), 1, def);
+  return Number.isFinite(n) ? n : def;
 }
 
 function invalidLink() {
@@ -207,7 +223,9 @@ export async function listInvitations(env, opts = {}) {
 // { ok: true } whatever happened to the email: the code never asks whether
 // it belongs to someone, so no branch can leak it. A second pending request
 // for the same address is not stored twice. The evidence a reviewer needs —
-// address, country, visitor, risk — is recorded with it.
+// address, country, visitor, risk — is recorded with it. The same batch trims
+// the table: ids are server-assigned and increasing, so the count trim is one
+// indexed lookup however many networks a flood comes from.
 export async function createAccessRequest(rc, input) {
   const env = rc.env;
   const t = nowOf(rc);
@@ -229,13 +247,18 @@ export async function createAccessRequest(rc, input) {
   const country = typeof rc.cf?.country === 'string' && /^[A-Z0-9]{2}$/.test(rc.cf.country) ? rc.cf.country : null;
   const visitor = typeof rc.fp?.hash === 'string' && /^[0-9a-f]{16,128}$/.test(rc.fp.hash) ? rc.fp.hash : null;
   const risk = toInt(rc.gate?.risk?.score, 0, 100);
-  await env.DB.prepare(
-    `INSERT INTO access_requests (email, full_name, reason, ip, country, visitor_id, risk, status, created_at)
-     SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?
-     WHERE NOT EXISTS (SELECT 1 FROM access_requests WHERE email = ? AND status = 'pending')`,
-  )
-    .bind(email, fullName, reason, ip, country, visitor, Number.isFinite(risk) ? risk : null, iso(t), email)
-    .run();
+  const db = env.DB;
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO access_requests (email, full_name, reason, ip, country, visitor_id, risk, status, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?
+         WHERE NOT EXISTS (SELECT 1 FROM access_requests WHERE email = ? AND status = 'pending')`,
+      )
+      .bind(email, fullName, reason, ip, country, visitor, Number.isFinite(risk) ? risk : null, iso(t), email),
+    db.prepare('DELETE FROM access_requests WHERE COALESCE(decided_at, created_at) < ?').bind(iso(t - REQUEST_MAX_AGE_MS)),
+    db.prepare('DELETE FROM access_requests WHERE id <= (SELECT MAX(id) FROM access_requests) - ?').bind(capOf(env, 'access_requests', REQUEST_CAP)),
+  ]);
   return { ok: true };
 }
 

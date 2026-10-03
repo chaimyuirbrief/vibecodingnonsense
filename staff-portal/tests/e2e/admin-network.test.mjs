@@ -4,7 +4,7 @@
 // runs (A §9).
 
 import { test, assert, run } from '../helpers/t.js';
-import { freshEnv, bootstrap, makeUser, stepUp, signIn, client, q, count, auditRows, advance, OWNER, OWNER_IP, HOUR, HOSTILE } from '../helpers/flows.js';
+import { freshEnv, bootstrap, makeUser, stepUp, signIn, client, q, count, auditRows, advance, setSetting, nowIso, OWNER, OWNER_IP, HOUR, HOSTILE } from '../helpers/flows.js';
 
 async function world() {
   const env = freshEnv();
@@ -222,6 +222,33 @@ test('reverting an allowlist add that would strip your own cover is refused by t
   const ok = await c.post(`/api/admin/audit/${add.id}/revert`, {});
   assert.equal(ok.status, 200, ok.text);
   assert.equal(count(env, 'SELECT COUNT(*) FROM allowed_ips WHERE id = ?', office.body.entry.id), 0);
+});
+
+
+// GATE-5 / FO-8: past 10,000 live blocks the gate used to read only the
+// oldest 10,000, so a block the console showed as active did not refuse
+// anyone. Every live block is enforced now, and the list stops growing there.
+test('a block past the 10,000th is still enforced at the gate; the API refuses to grow the list further', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  setSetting(env, 'access_mode', 'public');
+  q(
+    env,
+    `WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 10000 - 1)
+     INSERT INTO blocked_ips (cidr, reason, expires_at, created_by, created_at)
+     SELECT '5.' || (i / 65536) || '.' || ((i / 256) % 256) || '.' || (i % 256), 'feed', NULL, 1, ? FROM s`,
+    nowIso(env),
+  );
+  q(env, 'INSERT INTO blocked_ips (cidr, reason, created_at) VALUES (?, ?, ?)', '185.15.56.66/32', 'attacker', nowIso(env));
+  const r = await client(env, { ip: '185.15.56.66' }).get('/');
+  assert.equal(r.status, 403, 'the 10,001st block refuses its address');
+  assert.equal((await client(env, { ip: '185.15.56.67' }).get('/')).status, 200);
+  const listed = (await owner.client.get('/api/admin/network')).body.block.find((b) => b.cidr === '185.15.56.66/32');
+  assert.equal(listed.active, true);
+  await stepUp(env, owner.client);
+  const more = await owner.client.post('/api/admin/network/block', { cidr: '185.15.56.0/24', reason: 'more' });
+  assert.equal(more.status, 409, more.text);
+  assert.equal(more.body.code, 'blocklist_full');
 });
 
 await run();

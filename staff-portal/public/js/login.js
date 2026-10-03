@@ -16,7 +16,9 @@
 //
 // Fingerprinting runs in the background from page load (B §6). In
 // fingerprint_gate mode the login API answers 403 { fingerprint_required };
-// then we wait for the report and retry once.
+// then we wait for the report and retry once. A browser that is already
+// signed in waits for the report before it leaves, and never leaves twice
+// in a row for the address it is on (the gate would show it this page again).
 
 import { $, h, icon, api, ApiError, busy, showError, safeNext, param, go, confirmSignedIn, errorMessage } from './common.js';
 import { supportsPasskeys, getPasskey } from './webauthn.js';
@@ -392,17 +394,24 @@ function startMfa(resp) {
   openChooser();
 }
 
+// Wait for the report already in flight; send another if it failed.
+async function fingerprintLanded() {
+  const first = state.fp ? await state.fp : null;
+  if (first && first.ok) return first;
+  state.fp = reportFingerprint();
+  return state.fp;
+}
+
 async function login(identifier, password) {
   try {
     return await api('POST', '/api/auth/login', { identifier, password });
   } catch (err) {
     if (!(err instanceof ApiError && err.status === 403 && err.body && err.body.fingerprint_required === true)) throw err;
   }
-  // fingerprint_gate: the browser must report a fingerprint first. Wait for
-  // the report already in flight; send another if it failed; retry ONCE.
+  // fingerprint_gate: the browser must report a fingerprint first, then we
+  // retry ONCE.
   announce('Checking this browser…');
-  const first = state.fp ? await state.fp : null;
-  if (!first || !first.ok) await reportFingerprint();
+  await fingerprintLanded();
   try {
     return await api('POST', '/api/auth/login', { identifier, password });
   } catch (err) {
@@ -438,9 +447,16 @@ async function onPasswordSubmit(e) {
   });
 }
 
+// A pinned sign-in goes to the pinned step first; ?next= rides along so the
+// account page can carry on to it afterwards (account.js afterPinStep).
 function destinationAfter(resp) {
-  if (resp && resp.pinned && typeof resp.next === 'string') return safeNext(resp.next);
-  return safeNext(param('next'));
+  const carry = param('next');
+  if (resp && resp.pinned && typeof resp.next === 'string') {
+    const step = safeNext(resp.next);
+    const keep = carry && safeNext(carry, '') ? `${step.includes('?') ? '&' : '?'}next=${encodeURIComponent(safeNext(carry))}` : '';
+    return `${step}${keep}`;
+  }
+  return safeNext(carry);
 }
 
 async function finish(resp) {
@@ -465,6 +481,31 @@ async function finish(resp) {
 
 // ------------------------------------------------------------- start ----
 
+// The loop guard: this page sent the browser to this very address moments
+// ago and is being shown again — the gate still refuses it, so going again
+// would only loop. Without session storage there is no guard; waiting for
+// the report in init() is what normally breaks the loop.
+const AUTO_NAV_KEY = 'login.autoNav';
+const AUTO_NAV_MS = 30000;
+
+function bouncedBack() {
+  try {
+    const prev = JSON.parse(sessionStorage.getItem(AUTO_NAV_KEY) || 'null');
+    const age = prev && typeof prev.at === 'number' ? Date.now() - prev.at : Infinity;
+    return !!prev && prev.to === `${location.pathname}${location.search}` && age >= 0 && age < AUTO_NAV_MS;
+  } catch {
+    return false;
+  }
+}
+
+function noteAutoNav(dest) {
+  try {
+    sessionStorage.setItem(AUTO_NAV_KEY, JSON.stringify({ to: dest, at: Date.now() }));
+  } catch {
+    // Private mode without storage: no guard.
+  }
+}
+
 async function init() {
   el.formPassword.addEventListener('submit', onPasswordSubmit);
   el.formCode.addEventListener('submit', onCodeSubmit);
@@ -480,7 +521,8 @@ async function init() {
   el.startOver.addEventListener('click', startOver);
   el.cookieRetry.addEventListener('click', startOver);
 
-  // Background fingerprint report: never awaited here, never blocks sign-in.
+  // Background fingerprint report: never blocks the form; only a browser
+  // that is already signed in waits for it before leaving (below).
   state.fp = reportFingerprint();
 
   let who = null;
@@ -500,7 +542,18 @@ async function init() {
   }
   if (who.authenticated === true) {
     announce('You’re already signed in.');
-    go(safeNext(param('next')), { replace: true });
+    // A signed-in browser is shown this page when fingerprint_gate kept it
+    // in the sign-in shell (its fingerprint cookie lapsed) — or in a race
+    // with another tab. Leaving before the report lands tears it down, and
+    // the next page is this one again: a reload loop.
+    await fingerprintLanded();
+    const dest = safeNext(param('next'));
+    if (bouncedBack()) {
+      showError(el.passwordError, 'You’re signed in, but this portal couldn’t check this browser, so it can’t open yet. If you block scripts or cookies for this site, allow them, then reload the page.');
+      return;
+    }
+    noteAutoNav(dest);
+    go(dest, { replace: true });
   }
 }
 

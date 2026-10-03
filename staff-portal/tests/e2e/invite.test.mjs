@@ -4,7 +4,8 @@
 
 import { test, assert, run } from '../helpers/t.js';
 import {
-  freshEnv, client, bootstrap, actorRc, roleId, pageText, q, count, auditRows, advance, setSetting, DAY, MINUTE, OWNER_IP, PASSWORD, HOSTILE, DEVICE_COOKIE, SESSION_COOKIE,
+  freshEnv, client, bootstrap, makeUser, actorRc, roleId, rawRequest, Client, worker, pageText, q, count, auditRows, advance, setSetting, DAY, MINUTE, OWNER_IP, PASSWORD, HOSTILE,
+  DEVICE_COOKIE, SESSION_COOKIE,
 } from '../helpers/flows.js';
 import { createUser } from '../../src/users.js';
 import { createInvitation, revokeInvitation } from '../../src/invitations.js';
@@ -129,6 +130,88 @@ test('link lookups are limited per address, and a flood stops writing', async ()
   const s = client(env);
   for (let i = 0; i < 30; i++) nothing(await s.get(`/invite?token=${'B'.repeat(42)}${'ABCDEFGHIJKLMNOPQRSTUVWXYZabcd'[i]}`), `guess ${i}`);
   assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'invite_ip' AND subject = ?", s.ip), 20, 'peeked, not charged, past the limit');
+});
+
+// SPEC §13.6: an invitation token is a credential and is never logged. The
+// page's lookup carries it in the path, and the visit log and the worker's
+// "unexpected failure" audit row both record paths — which the read-only
+// Auditor reads (visitors.view, audit.view) and could then redeem.
+test('a refused or failed lookup leaves the token in no log an Auditor can read', async () => {
+  const { env, owner, rc } = await world();
+  const auditor = await makeUser(env, owner.client, { role: 'auditor', email: 'audrey@acme.com' });
+  const adam = await createUser(rc, { email: 'newadmin@acme.com', full_name: 'New Admin', role_id: roleId(env, 'admin') });
+  const { token } = await createInvitation(rc, adam.id);
+
+  const home = client(env);
+  assert.equal((await home.get(`/invite?token=${token}`)).status, 200);
+  // Refused at the gate: the pass did not come back (a cookie-blocking
+  // webview, a pass that expired, the address changed mid-load).
+  home.jar.delete(PASS_COOKIE);
+  nothing(await home.get(`/api/invite/${token}`), 'lookup without the pass');
+  // Failed in the handler: a transient database error during the lookup.
+  assert.equal((await home.get(`/invite?token=${token}`)).status, 200);
+  env.DB.failOn = /FROM invitations WHERE token_hash/;
+  const failed = await home.get(`/api/invite/${token}`);
+  env.DB.failOn = null;
+  assert.equal(failed.status, 500);
+
+  const visits = q(env, 'SELECT path FROM visits').map((r) => r.path || '');
+  assert.ok(visits.includes('/api/invite/:token'), 'the refusal is still recorded, without its token');
+  assert.ok(!visits.some((p) => p.includes(token)), 'no token in visits');
+  const audit = JSON.stringify(auditRows(env));
+  assert.match(audit, /Unexpected failure on GET \/api\/invite\/:token/);
+  assert.ok(!audit.includes(token), 'no token in the audit log');
+  const seen = await auditor.client.get('/api/admin/visits?limit=500');
+  assert.equal(seen.status, 200, seen.text);
+  assert.ok(!seen.text.includes(token));
+  const log = await auditor.client.get('/api/admin/audit?limit=200');
+  assert.equal(log.status, 200, log.text);
+  assert.ok(!log.text.includes(token));
+  assert.equal(q(env, 'SELECT status FROM users WHERE id = ?', adam.id)[0].status, 'invited', 'the invitation is still unredeemed');
+});
+
+// The lookup with the token in the body: no URL ever holds it, and as a POST
+// it must come from our own origin.
+test('POST /api/invite/lookup answers like the GET, inside the invite shell, with no token in any path', async () => {
+  const { env, inv } = await world();
+  const s = client(env);
+  assert.equal((await s.get(`/invite?token=${inv.token}`)).status, 200);
+  const r = await s.post('/api/invite/lookup', { token: inv.token });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.body.email, 'ivan@acme.com');
+  assert.deepEqual(Object.keys(r.body).sort(), ['email', 'expires_at', 'full_name', 'org_name', 'privacy_notice']);
+  for (const bad of ['', 'short', 'A'.repeat(43), null, 42, {}]) assert.equal((await s.post('/api/invite/lookup', { token: bad })).status, 404, JSON.stringify(bad));
+  const cross = await s.post('/api/invite/lookup', { token: inv.token }, { origin: 'https://evil.example' });
+  assert.equal(cross.status, 403);
+  assert.ok(!q(env, 'SELECT path FROM visits').some((v) => (v.path || '').includes(inv.token)));
+  // Without the pass it is refused like everything else in that shell.
+  nothing(await client(env).post('/api/invite/lookup', { token: inv.token }), 'no pass');
+});
+
+// Cross-site GETs pass the worker's same-origin check, so an <img> pointing
+// at the lookup on any page a browser behind the office address opens would
+// spend that address's invite_ip bucket and stop new hires there accepting.
+test('cross-site loads of the lookup are refused uncharged; a new hire on that address still gets in', async () => {
+  const { env, inv } = await world();
+  for (let i = 0; i < 25; i++) {
+    const r = await rawRequest(env, 'GET', `/api/invite/junk${i}`, {
+      ip: OWNER_IP,
+      headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'no-cors', 'sec-fetch-dest': 'image' },
+    });
+    assert.equal(r.status, 404);
+  }
+  // A real token, loaded cross-site, says nothing either.
+  const leak = await rawRequest(env, 'GET', `/api/invite/${inv.token}`, { ip: OWNER_IP, headers: { 'sec-fetch-site': 'cross-site' } });
+  assert.equal(leak.status, 404);
+  assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'invite_ip'"), 0, 'nothing was charged');
+
+  const hire = new Client(worker, env, { ip: OWNER_IP });
+  assert.equal((await hire.get(`/invite?token=${inv.token}`)).status, 200);
+  const lookup = await hire.get(`/api/invite/${inv.token}`, { 'sec-fetch-site': 'same-origin' });
+  assert.equal(lookup.status, 200, lookup.text);
+  assert.equal(lookup.body.email, 'ivan@acme.com');
+  const accept = await hire.post('/api/invite/accept', { token: inv.token, password: PASSWORD, full_name: 'Ivan Invitee' });
+  assert.equal(accept.status, 200, accept.text);
 });
 
 await run();

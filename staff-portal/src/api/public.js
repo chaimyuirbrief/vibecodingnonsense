@@ -176,9 +176,35 @@ function invalidInvitation() {
   return new HttpError(404, { error: 'This invitation link is no longer valid. Ask for a new one.', code: 'invitation_invalid' });
 }
 
+// The invitation page looks its token up with a same-origin fetch. A
+// cross-site load — an <img> on any page a browser behind the office address
+// opens — is answered like an unknown token and charged nothing: GETs pass
+// the worker's same-origin check, so otherwise twenty of them would spend
+// the address's invite_ip bucket and stop every new hire there accepting
+// their invitation for an hour. A client that sends no Sec-Fetch-Site is
+// charged as before.
+function crossSite(rc) {
+  const site = rc.request?.headers?.get('sec-fetch-site');
+  return typeof site === 'string' && site !== 'same-origin';
+}
+
 async function invitationInfo(rc, params) {
+  if (crossSite(rc)) throw invalidInvitation();
+  return describeInvitation(rc, params.token);
+}
+
+// The same lookup with the token in the body, where no URL — and so no
+// proxy, history or path log anywhere — ever holds it (SPEC §13.6). A POST
+// must also come from our own origin. The page moves to it; the GET stays
+// until it has.
+async function invitationLookup(rc) {
+  const b = await body(rc);
+  return describeInvitation(rc, b.token);
+}
+
+async function describeInvitation(rc, token) {
   await chargeOr429(rc, 'invite_ip');
-  const found = await lookupInvitation(rc.env, params.token, rc.nowMs);
+  const found = await lookupInvitation(rc.env, token, rc.nowMs);
   if (!found) throw invalidInvitation();
   return json(200, {
     email: found.user.email,
@@ -279,6 +305,7 @@ export function register(router) {
   router.add('GET', '/api/setup/status', setupStatus, { auth: 'none' });
   router.add('POST', '/api/setup', setup, { auth: 'none' });
   router.add('GET', '/api/invite/:token', invitationInfo, { auth: 'none' });
+  router.add('POST', '/api/invite/lookup', invitationLookup, { auth: 'none' });
   router.add('POST', '/api/invite/accept', acceptInvite, { auth: 'none' });
   router.add('POST', '/api/access-request', accessRequest, { auth: 'none' });
   router.add('POST', '/api/fp', fingerprint, { auth: 'none' });

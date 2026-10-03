@@ -8,6 +8,7 @@ import {
   isPrivateOrReserved,
   isWholeFamily,
   bestMatch,
+  rateLimitNetwork,
 } from '../../src/ip.js';
 
 const throwing = new Proxy({}, { get() { throw new Error('boom'); }, has() { throw new Error('boom'); }, ownKeys() { throw new Error('boom'); } });
@@ -333,6 +334,19 @@ test('returned bytes are copies: mutating them changes nothing', () => {
   ip.bytes[0] = 10;
   assert.equal(cidrContains(c, '81.2.69.5'), true);
   assert.equal(normalizeIp('81.2.69.5'), '81.2.69.5');
+});
+
+
+test('rateLimitNetwork: IPv4 is the address, IPv6 is its /64, anything else is null', () => {
+  assert.equal(rateLimitNetwork('81.2.69.142'), '81.2.69.142');
+  assert.equal(rateLimitNetwork('::ffff:81.2.69.142'), '81.2.69.142', 'an IPv4-mapped address is the IPv4 address');
+  assert.equal(rateLimitNetwork('2a02:1210:5c00:9e00:1234:5678:9abc:def0'), '2a02:1210:5c00:9e00::/64');
+  assert.equal(rateLimitNetwork('2A02:1210:5C00:9E00::1'), '2a02:1210:5c00:9e00::/64');
+  assert.equal(rateLimitNetwork('2001:db8::1'), '2001:db8::/64');
+  assert.equal(rateLimitNetwork('::1'), '::/64');
+  for (const v of [null, undefined, NaN, Infinity, '', '   ', 'abc', {}, [], true, 0, Symbol('x'), '1.2.3.4/24', 'fe80::1%eth0', '[::1]']) {
+    assert.equal(rateLimitNetwork(v), null, String(typeof v === 'symbol' ? 'Symbol' : JSON.stringify(v)));
+  }
 });
 
 await run();

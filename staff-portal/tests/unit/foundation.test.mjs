@@ -5,6 +5,9 @@ import * as c from '../../src/crypto.js';
 import { ensureSchema, DDL } from '../../src/schema.js';
 import { SYSTEM_ROLES, PERMISSIONS, RESERVED } from '../../src/catalog.js';
 import { Router } from '../../src/router.js';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOSTILE = [null, undefined, NaN, Infinity, -Infinity, '', '   ', 'abc', {}, [], true, false, Symbol('x'), 10n, () => 1, { valueOf() { throw new Error('boom'); } }];
 
@@ -155,6 +158,63 @@ test('router matches params and reports 405', () => {
   assert.equal(m.params.id, '42');
   assert.ok(r.match('POST', '/api/admin/users/42').methodNotAllowed);
   assert.equal(r.match('GET', '/api/admin/users/42/x'), null);
+});
+
+
+test('loggablePath keeps invitation tokens (and token-length segments) out of stored paths', () => {
+  const token = u.randomToken(32);
+  assert.equal(u.loggablePath(`/api/invite/${token}`), '/api/invite/:token');
+  assert.equal(u.loggablePath('/api/invite/x'), '/api/invite/:token', 'even a junk lookup: the segment is whatever was typed');
+  assert.equal(u.loggablePath(`/api/invite/${encodeURIComponent(token + '<')}`), '/api/invite/:token');
+  assert.equal(u.loggablePath('/api/invite/accept'), '/api/invite/accept');
+  assert.equal(u.loggablePath('/api/invite/lookup'), '/api/invite/lookup', 'the body-token lookup is a route, not a token');
+  assert.equal(u.loggablePath(`/${token}`), '/:token');
+  assert.equal(u.loggablePath(`/js/${token}/x.js`), '/js/:token/x.js');
+  // Inventory ids are not credentials (SPEC §13.6) and stay readable.
+  assert.equal(u.loggablePath('/api/admin/devices/abcdefghijklmnopqrstuv'), '/api/admin/devices/abcdefghijklmnopqrstuv');
+  assert.equal(u.loggablePath('/invite'), '/invite');
+  for (const v of HOSTILE) if (typeof v !== 'string') assert.equal(u.loggablePath(v), '');
+});
+
+
+// SPEC §15.6, CONTRACTS §0.3 and §0.7: one clock (util.now, which tests
+// replace), and total coercion. The webauthn suite scans its own directory;
+// this scans all of src/, so a Date.now() in recordVisit or revokeSession —
+// invisible to every test that injects a clock — cannot come back.
+test('static: no Date.now() in src/ but util.now; no raw Number/parseFloat/Date.parse; parseInt only behind ip.js shape checks', () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src');
+  const walk = (d) => readdirSync(d).flatMap((n) => {
+    const f = path.join(d, n);
+    return statSync(f).isDirectory() ? walk(f) : f.endsWith('.js') ? [f] : [];
+  });
+  const files = walk(root);
+  assert.ok(files.length > 30, 'the scan sees the source tree');
+  const offenders = [];
+  for (const f of files) {
+    const rel = path.relative(root, f);
+    // Comments may say "never Date.now()"; code may not.
+    const src = readFileSync(f, 'utf8').replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    // util.js is where now(), toNum, toInt and parseIsoStrict live.
+    const vetted = rel === 'util.js';
+    const rules = [
+      [/Date\.now\(/, !vetted],
+      [/Date\.parse\(/, !vetted],
+      [/\bparseFloat\(/, !vetted],
+      [/[^.\w]Number\((?!\.)/, !vetted],
+      [/\bparseInt\(/, !vetted && rel !== 'ip.js'],
+    ];
+    for (const [re, applies] of rules) if (applies && re.test(src)) offenders.push(`${rel}: ${re}`);
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test('readJson: a JSON body sent as text/plain is no body (the second CSRF brake, SPEC §3.4)', async () => {
+  for (const ct of ['text/plain', 'text/plain;charset=UTF-8', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', '', 'application/jsonx']) {
+    const req = new Request('https://staff.example.com/api/x', { method: 'POST', headers: ct ? { 'content-type': ct } : {}, body: '{"a":1}' });
+    assert.equal(await u.readJson(req), null, ct || '(none)');
+  }
+  const ok = new Request('https://staff.example.com/api/x', { method: 'POST', headers: { 'content-type': 'application/json; charset=utf-8' }, body: '{"a":1}' });
+  assert.deepEqual(await u.readJson(ok), { a: 1 });
 });
 
 await run();

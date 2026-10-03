@@ -177,16 +177,27 @@ export async function getUser(env, id) {
   return env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(uid).first();
 }
 
-// Emails and usernames are stored lowercased, so lowercasing the identifier
-// is the whole of "case-insensitive".
-export async function findUserByIdentifier(env, identifier) {
+// The one normal form of a sign-in name: the email or username exactly as
+// the lookup matches it, or null. The login_id bucket keys on this too, so
+// two spellings the lookup treats as one account (case, surrounding space, a
+// username typed past its 32 characters) are one bucket (SPEC §6.4).
+export function canonicalIdentifier(identifier) {
   if (typeof identifier !== 'string') return null;
   if (identifier.includes('@')) {
     const email = normEmail(identifier);
-    return email ? env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first() : null;
+    return email ? { kind: 'email', value: email } : null;
   }
   const username = normUsername(identifier);
-  return username ? env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first() : null;
+  return username ? { kind: 'username', value: username } : null;
+}
+
+// Emails and usernames are stored lowercased, so lowercasing the identifier
+// is the whole of "case-insensitive".
+export async function findUserByIdentifier(env, identifier) {
+  const id = canonicalIdentifier(identifier);
+  if (!id) return null;
+  const sql = id.kind === 'email' ? 'SELECT * FROM users WHERE email = ?' : 'SELECT * FROM users WHERE username = ?';
+  return env.DB.prepare(sql).bind(id.value).first();
 }
 
 function roleShape(r, fallbackId) {

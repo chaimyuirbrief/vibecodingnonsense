@@ -31,7 +31,7 @@
     <div id="status-error" class="banner banner-warn" role="alert" hidden></div>
 
     <section id="pane-form" aria-labelledby="title">
-      <form id="form-setup" novalidate>
+      <form id="form-setup" method="post" novalidate>
         <div class="field">
           <label for="setup_key">Setup key</label>
           <input id="setup_key" name="setup_key" type="password" autocomplete="off" spellcheck="false" required aria-describedby="setup_key-hint">
@@ -93,5 +93,6 @@
     </section>
   </div>
 </main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

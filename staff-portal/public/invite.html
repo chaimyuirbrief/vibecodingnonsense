@@ -54,7 +54,7 @@
         <dt>Link expires</dt>
         <dd id="invite-expires"></dd>
       </dl>
-      <form id="form-invite" novalidate>
+      <form id="form-invite" method="post" novalidate>
         <div class="field">
           <label for="full_name">Your full name</label>
           <input id="full_name" name="full_name" type="text" autocomplete="name" required>
@@ -98,5 +98,6 @@
     </p>
   </div>
 </main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

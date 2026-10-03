@@ -39,7 +39,7 @@
 
     <!-- Step 1: password -->
     <section id="pane-password" aria-labelledby="title">
-      <form id="form-password" novalidate>
+      <form id="form-password" method="post" novalidate>
         <div class="field">
           <label for="identifier">Email or username</label>
           <input id="identifier" name="identifier" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
@@ -64,7 +64,7 @@
 
     <!-- Step 2b: authenticator app or backup code (one box, A §7.3) -->
     <section id="pane-code" aria-labelledby="code-label" hidden>
-      <form id="form-code" novalidate>
+      <form id="form-code" method="post" novalidate>
         <div class="field">
           <label id="code-label" for="code">Code from your authenticator app</label>
           <input id="code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="32" placeholder="123456" required>
@@ -80,7 +80,7 @@
 
     <!-- Step 2c: a code we sent by text or email -->
     <section id="pane-otp" aria-labelledby="otp-label" hidden>
-      <form id="form-otp" novalidate>
+      <form id="form-otp" method="post" novalidate>
         <p id="otp-sent" class="banner banner-info" aria-live="polite"></p>
         <div class="field">
           <label id="otp-label" for="otp">Code</label>
@@ -152,5 +152,6 @@
   </div>
   <p class="auth-below">Forgotten your password or lost your phone? Ask an administrator — they can reset it.</p>
 </main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

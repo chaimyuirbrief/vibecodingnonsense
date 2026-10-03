@@ -2,7 +2,7 @@
 // §8.4; A §10; B §8). The clock starts Tue 2026-01-06 10:00 New York.
 
 import { test, assert, run } from '../helpers/t.js';
-import { freshEnv, bootstrap, makeUser, q, count, auditRows, advance, setSetting, HOUR, DAY, PASSWORD } from '../helpers/flows.js';
+import { freshEnv, bootstrap, makeUser, stepUp, signIn, q, count, auditRows, advance, setSetting, HOUR, DAY, PASSWORD, OWNER } from '../helpers/flows.js';
 
 async function world() {
   const env = freshEnv();
@@ -92,7 +92,7 @@ test('two sign-ins on one day count once', async () => {
 });
 
 test('a streak can never block a sign-in: the table is dropped and sign-in still succeeds (A §10)', async () => {
-  const { env, bob } = await world();
+  const { env, owner, bob } = await world();
   env.DB.sqlite.exec('DROP TABLE streaks');
   advance(env, DAY);
   const sessions = count(env, 'SELECT COUNT(*) FROM sessions WHERE user_id = ?', bob.user.id);
@@ -101,6 +101,104 @@ test('a streak can never block a sign-in: the table is dropped and sign-in still
   assert.equal(count(env, 'SELECT COUNT(*) FROM sessions WHERE user_id = ?', bob.user.id), sessions + 1);
   assert.equal(auditRows(env, 'login.success').at(-1).target_id, String(bob.user.id));
   assert.equal((await bob.client.get('/api/me')).status, 200, 'the rest of the account works');
+  // FO-9, CONTRACTS §0.4: the real exception reaches the audit log — a
+  // broken table that stops every sign-in counting is not silent.
+  const errs = auditRows(env, 'streak.error');
+  assert.equal(errs.length, 1, 'exactly one row for the one failed touch');
+  assert.equal(errs[0].severity, 'critical');
+  assert.equal(errs[0].target_id, String(bob.user.id));
+  assert.match(errs[0].error, /no such table: streaks/);
+
+  // STREAK-2, SPEC §16.38: nor does it take the console down. The overview and
+  // the person panel — suspend, reset factors, sign out — still load.
+  assert.equal((await signIn(env, owner.client, OWNER.email, OWNER.password)).status, 200);
+  const overview = await owner.client.get('/api/admin/overview');
+  assert.equal(overview.status, 200, overview.text);
+  assert.equal(overview.body.counts.streaks_active, null);
+  const person = await owner.client.get(`/api/admin/users/${bob.user.id}`);
+  assert.equal(person.status, 200, person.text);
+  assert.equal(person.body.streak, null);
+  assert.equal(person.body.user.email, 'bob@acme.com');
+  await stepUp(env, owner.client);
+  assert.equal((await owner.client.post(`/api/admin/users/${bob.user.id}/status`, { status: 'suspended' })).status, 200);
+  assert.ok(auditRows(env, 'streak.error').some((e) => /no such table: streaks/.test(e.error) && /served without it/.test(e.detail)), 'the console read is recorded too');
+});
+
+// STREAK-4: an administrator's restore claims today without logging it, so
+// the person's own sign-in that day must be logged — not drawn as missed in
+// the middle of an unbroken run.
+test('a restore claims today; the person’s own sign-in that day is still logged and counted', async () => {
+  const { env, owner, bob } = await world();
+  advance(env, 22 * HOUR); // Wed 08:00
+  assert.equal((await signIn(env, owner.client, OWNER.email, OWNER.password)).status, 200);
+  await stepUp(env, owner.client);
+  assert.equal((await owner.client.post(`/api/admin/users/${bob.user.id}/streak`, { current: 5, reason: 'Portal outage' })).status, 200);
+  const totalBefore = row(env, bob.user.id).total_days;
+  advance(env, HOUR); // Wed 09:00
+  const wed = (await signInBob(bob)).body.streak;
+  assert.equal(wed.current, 5, 'today was already counted by the restore');
+  assert.equal(row(env, bob.user.id).total_days, totalBefore + 1, 'but the day itself is now on record');
+  advance(env, 2 * HOUR); // a second sign-in that day adds nothing
+  await signInBob(bob);
+  assert.equal(row(env, bob.user.id).total_days, totalBefore + 1);
+  advance(env, 22 * HOUR); // Thu 09:00
+  assert.equal((await signInBob(bob)).body.streak.current, 6);
+  assert.deepEqual(q(env, 'SELECT day FROM streak_days WHERE user_id = ? ORDER BY day', bob.user.id).map((r) => r.day), ['2026-01-06', '2026-01-07', '2026-01-08']);
+  const hist = (await bob.client.get('/api/me/streak')).body.history.slice(-3);
+  assert.deepEqual(hist.map((d) => [d.day, d.counted]), [['2026-01-06', true], ['2026-01-07', true], ['2026-01-08', true]]);
+});
+
+test('set to 0, then a sign-in the same day starts the new streak the page promises', async () => {
+  const { env, owner, bob } = await world();
+  advance(env, 23 * HOUR); // Wed 09:00
+  assert.equal((await signInBob(bob)).body.streak.current, 2);
+  advance(env, HOUR);
+  assert.equal((await signIn(env, owner.client, OWNER.email, OWNER.password)).status, 200);
+  await stepUp(env, owner.client);
+  assert.equal((await owner.client.post(`/api/admin/users/${bob.user.id}/streak`, { current: 0, reason: 'Shared account, reset' })).status, 200);
+  const zero = (await bob.client.get('/api/me/streak')).body.status;
+  assert.equal(zero.state, 'lapsed');
+  advance(env, HOUR); // Wed 11:00
+  const s = (await signInBob(bob)).body.streak;
+  assert.deepEqual([s.state, s.current, s.counted_today, s.started_day], ['active', 1, true, '2026-01-07']);
+  assert.equal(row(env, bob.user.id).total_days, 2, 'Wednesday was already on record: not counted twice');
+  advance(env, DAY);
+  assert.equal((await signInBob(bob)).body.streak.current, 2);
+});
+
+// STREAK-1: undoing an old adjustment must not silently replace the days the
+// person has earned since (total_days included, which nothing else can set
+// back); and the audit.revert row says what it overwrote.
+test('reverting an adjustment: refused once they have signed in since; recorded in full when it goes ahead', async () => {
+  const { env, owner, bob } = await world();
+  const uid = bob.user.id;
+  await stepUp(env, owner.client);
+  assert.equal((await owner.client.post(`/api/admin/users/${uid}/streak`, { current: 5, reason: 'Portal outage' })).status, 200);
+  const adj = auditRows(env, 'streak.adjust').at(-1);
+  for (let i = 0; i < 10; i++) {
+    advance(env, DAY);
+    await signInBob(bob);
+  }
+  const earned = row(env, uid);
+  assert.deepEqual([earned.current, earned.longest, earned.total_days], [15, 15, 11]);
+  assert.equal((await signIn(env, owner.client, OWNER.email, OWNER.password)).status, 200);
+  await stepUp(env, owner.client);
+  const rev = await owner.client.post(`/api/admin/audit/${adj.id}/revert`, {});
+  assert.equal(rev.status, 409, rev.text);
+  assert.equal(rev.body.code, 'changed_since');
+  assert.deepEqual(row(env, uid), earned, 'nothing was overwritten');
+  assert.equal(auditRows(env, 'audit.revert').at(-1).outcome, 'denied');
+
+  // An adjustment nobody has signed in after reverts as before, and the
+  // revert row records what it replaced and what it left.
+  assert.equal((await owner.client.post(`/api/admin/users/${uid}/streak`, { current: 30, reason: 'Typo test' })).status, 200);
+  const adj2 = auditRows(env, 'streak.adjust').at(-1);
+  const ok = await owner.client.post(`/api/admin/audit/${adj2.id}/revert`, {});
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual([row(env, uid).current, row(env, uid).total_days], [15, 11]);
+  const revRow = auditRows(env, 'audit.revert').at(-1);
+  assert.equal(JSON.parse(revRow.before_state).current, 30);
+  assert.equal(JSON.parse(revRow.after_state).current, 15);
 });
 
 test('an unreadable stored streak restarts at 1 and is audited, and the sign-in succeeds', async () => {

@@ -266,4 +266,60 @@ test('removeAllowed returns the row it removed; unknown ids are 404', async () =
   await assert.rejects(N.removeAllowed(rcFor(env), a.id), (e) => e instanceof HttpError && e.status === 404);
 });
 
+
+// GATE-5 / FO-8: the lists used to be read `ORDER BY id LIMIT 10000` — the
+// OLDEST rows — so past 10,000 live blocks the newest ones, shown as active
+// in the console, were never consulted (a hard block that failed open).
+function seedBlocks(env, n, { expiresAt = null } = {}) {
+  env.DB.q(
+    `WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < ? - 1)
+     INSERT INTO blocked_ips (cidr, reason, expires_at, created_by, created_at)
+     SELECT '5.' || (i / 65536) || '.' || ((i / 256) % 256) || '.' || (i % 256), 'feed', ?, NULL, ? FROM s`,
+    n,
+    expiresAt,
+    iso(env.__clock()),
+  );
+}
+
+test('every live block is enforced, however many there are; the console agrees', async () => {
+  const env = await makeEnvWithSchema();
+  const t = env.__clock();
+  seedBlocks(env, 10000);
+  env.DB.q('INSERT INTO blocked_ips (cidr, reason, created_at) VALUES (?, ?, ?)', '185.15.56.99/32', 'newest', iso(t));
+  assert.equal(await N.isIpBlocked(env, '185.15.56.99', t), true, 'the 10,001st block is in force');
+  assert.equal(await N.isIpBlocked(env, '5.0.0.1', t), true, 'and the first');
+  assert.equal(await N.isIpBlocked(env, '185.15.56.98', t), false);
+  const listed = (await N.listBlocked(env, t)).find((r) => r.cidr === '185.15.56.99/32');
+  assert.equal(listed.active, true);
+  // The same for the allowlist, where truncation failed closed.
+  env.DB.q(
+    `WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHERE i < 10000 - 1)
+     INSERT INTO allowed_ips (cidr, tier, created_at, updated_at) SELECT '6.' || (i / 65536) || '.' || ((i / 256) % 256) || '.' || (i % 256), 2, ?, ? FROM s`,
+    iso(t),
+    iso(t),
+  );
+  rawAllow(env, '81.2.69.0/24', 1);
+  assert.equal((await N.tierForIp(env, '81.2.69.7', t))?.tier, 1);
+});
+
+test('the blocklist holds at most 10,000 live entries: past that an addition is refused with a sentence', async () => {
+  const env = await makeEnvWithSchema();
+  const rc = rcFor(env);
+  seedBlocks(env, 10000);
+  await assert.rejects(N.addBlocked(rc, { cidr: '185.15.56.0/24' }), (e) => e instanceof HttpError && e.status === 409 && e.body.code === 'blocklist_full' && /10,000/.test(e.message));
+  assert.equal(count(env, 'blocked_ips'), 10000);
+  // Expired entries do not count toward it.
+  const fresh = await makeEnvWithSchema();
+  seedBlocks(fresh, 10000, { expiresAt: iso(fresh.__clock() - HOUR) });
+  assert.equal((await N.addBlocked(rcFor(fresh), { cidr: '185.15.56.0/24' })).cidr, '185.15.56.0/24');
+  // __retention can lower the cap, never raise it.
+  const small = await makeEnvWithSchema();
+  small.__retention = (k) => (k === 'blocked_ips' ? 3 : undefined);
+  for (const c of ['185.15.56.1', '185.15.56.2', '185.15.56.3']) await N.addBlocked(rcFor(small), { cidr: c });
+  await assert.rejects(N.addBlocked(rcFor(small), { cidr: '185.15.56.4' }), (e) => e.status === 409);
+  small.__retention = () => 1_000_000;
+  seedBlocks(small, 9997);
+  await assert.rejects(N.addBlocked(rcFor(small), { cidr: '185.15.56.5' }), (e) => e.status === 409);
+});
+
 await run();

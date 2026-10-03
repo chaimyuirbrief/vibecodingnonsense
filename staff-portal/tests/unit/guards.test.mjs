@@ -143,12 +143,12 @@ test('block: a range containing the caller is refused, v4 and v6; others pass', 
   const { env, owner } = await world();
   const rc = await rcFor(env, owner);
   for (const cidr of [HOME, `${HOME}/32`, '81.2.69.0/24', '81.0.0.0/8', '::ffff:81.2.69.142']) {
-    assert.throws(() => assertCanBlock(rc, cidr), (e) => e instanceof GuardError && e.code === 'self_lockout', cidr);
+    await assert.rejects(() => assertCanBlock(rc, cidr), (e) => e instanceof GuardError && e.code === 'self_lockout', cidr);
   }
-  for (const cidr of ['185.15.56.0/24', '2a00::/16', '81.2.70.0/24', ...HOSTILE]) assertCanBlock(rc, cidr);
+  for (const cidr of ['185.15.56.0/24', '2a00::/16', '81.2.70.0/24', ...HOSTILE]) await assertCanBlock(rc, cidr);
   const v6 = await rcFor(env, owner, { ip: '2a00:1450:4001:80b::200e' });
-  assert.throws(() => assertCanBlock(v6, '2a00::/16'), GuardError);
-  assertCanBlock(v6, '81.2.69.0/24');
+  await assert.rejects(() => assertCanBlock(v6, '2a00::/16'), GuardError);
+  await assertCanBlock(v6, '81.2.69.0/24');
 });
 
 test('settings: each blocking case away from the allowlist, and the allowlist bypass', async () => {

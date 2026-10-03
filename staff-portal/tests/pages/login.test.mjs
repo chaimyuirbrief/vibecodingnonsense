@@ -2,7 +2,7 @@
 // exactly; A §5 cookie detection; B §6 fingerprint + notice; B §10).
 
 import { test, assert, run } from '../helpers/t.js';
-import { loadPage, reply, drain } from '../helpers/dom.js';
+import { loadPage, importFresh, reply, drain } from '../helpers/dom.js';
 
 const ORIGIN = 'https://staff.example.com';
 const PANES = ['pane-password', 'pane-choose', 'pane-code', 'pane-otp', 'pane-passkey', 'pane-none', 'pane-cookie', 'pane-enroll'];
@@ -100,6 +100,61 @@ test('load: already signed in → straight to safeNext(?next)', async () => {
   }
 });
 
+test('load: already signed in → the fingerprint report lands before the page leaves; a failed one is sent again (FE-1)', async () => {
+  // fingerprint_gate shows this page to a signed-in browser whose fingerprint
+  // cookie lapsed; leaving before the report lands tears it down and the gate
+  // shows this page again — a reload loop.
+  let release;
+  const held = new Promise((r) => (release = r));
+  const page = await open({ whoami: reply(200, { authenticated: true }), fetch: { 'POST /api/fp': async () => (await held, reply(200, { ok: true })) } });
+  assert.deepEqual(page.calls.nav, [], 'left while the report was still in flight');
+  release();
+  await page.drain();
+  assert.deepEqual(page.calls.nav, [{ type: 'replace', url: '/' }]);
+  page.dispose();
+
+  const again = await open({ whoami: reply(200, { authenticated: true }), fetch: { 'POST /api/fp': [reply(503, null), reply(200, { ok: true })] } });
+  assert.equal(again.requests('/api/fp').length, 2, 'the failed report was sent again');
+  assert.deepEqual(again.calls.nav, [{ type: 'replace', url: '/' }]);
+  again.dispose();
+});
+
+test('load: already signed in, but this page sent the browser to this very address moments ago → no second trip, an explanation (FE-1 loop guard)', async () => {
+  const stub = { 'GET /api/auth/whoami': reply(200, { authenticated: true }), 'POST /api/fp': reply(200, { ok: true }) };
+  const at = async (url, marker) => {
+    const page = await loadPage('login.html', { url, import: false, fetch: stub });
+    if (marker) sessionStorage.setItem('login.autoNav', JSON.stringify(marker));
+    await importFresh('js/login.js');
+    await page.drain();
+    return page;
+  };
+  const first = await at(`${ORIGIN}/`, null);
+  assert.deepEqual(first.calls.nav, [{ type: 'replace', url: '/' }]);
+  const marker = JSON.parse(sessionStorage.getItem('login.autoNav'));
+  assert.equal(marker.to, '/', 'the trip is remembered');
+  first.dispose();
+
+  const bounced = await at(`${ORIGIN}/`, marker);
+  assert.deepEqual(bounced.calls.nav, [], 'shown again at the address it just went to: going again would loop');
+  assert.ok(bounced.visible('password-error'));
+  assert.match(bounced.text('password-error'), /signed in, but this portal couldn’t check this browser/);
+  assert.deepEqual(shown(bounced), ['pane-password']);
+  bounced.dispose();
+
+  for (const [url, m, why] of [
+    [`${ORIGIN}/`, { ...marker, at: Date.now() - 60000 }, 'a trip a minute ago is not a loop'],
+    [`${ORIGIN}/login?next=/admin`, marker, 'a different address is not a loop'],
+  ]) {
+    const p = await at(url, m);
+    assert.equal(p.calls.nav.length, 1, why);
+    p.dispose();
+  }
+  const noStorage = await loadPage('login.html', { url: `${ORIGIN}/`, localStorage: 'throw', fetch: stub });
+  assert.deepEqual(noStorage.calls.nav, [{ type: 'replace', url: '/' }], 'storage that throws: no guard, still goes');
+  assert.deepEqual(noStorage.calls.pageErrors, []);
+  noStorage.dispose();
+});
+
 test('load: whoami failing leaves a working form', async () => {
   const page = await open({ whoami: reply(200, null, { networkError: true }) });
   assert.deepEqual(shown(page), ['pane-password']);
@@ -138,11 +193,18 @@ test('cookie refused: login 200 but whoami still signed out → say so plainly, 
   }
 });
 
-test('pinned sign-in goes to response.next, not ?next', async () => {
-  const page = await open({ url: `${ORIGIN}/login?next=/admin`, fetch: { 'POST /api/auth/login': reply(200, { ...DONE, pinned: 'mfa_enroll', next: '/account?pin=mfa_enroll' }) } });
-  await signIn(page);
-  assert.deepEqual(page.calls.nav, [{ type: 'replace', url: '/account?pin=mfa_enroll' }]);
-  page.dispose();
+test('pinned sign-in goes to response.next first, carrying ?next for afterwards (FE-5)', async () => {
+  const pinned = { 'POST /api/auth/login': reply(200, { ...DONE, pinned: 'mfa_enroll', next: '/account?pin=mfa_enroll' }) };
+  for (const [query, want] of [
+    ['?next=/admin', '/account?pin=mfa_enroll&next=%2Fadmin'],
+    ['', '/account?pin=mfa_enroll'],
+    [`?next=${encodeURIComponent('https://evil.example/')}`, '/account?pin=mfa_enroll'],
+  ]) {
+    const page = await open({ url: `${ORIGIN}/login${query}`, fetch: pinned });
+    await signIn(page);
+    assert.deepEqual(page.calls.nav, [{ type: 'replace', url: want }], query || '(no next)');
+    page.dispose();
+  }
 });
 
 test('a pinned next that is not ours is still refused', async () => {

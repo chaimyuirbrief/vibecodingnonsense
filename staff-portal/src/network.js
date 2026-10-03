@@ -12,7 +12,7 @@
 
 import { iso, now, toInt, strStrict, parseIsoStrict, HOUR, isoShapeSql } from './util.js';
 import { parseIp, normalizeCidr, isPrivateOrReserved, isWholeFamily, cidrContains, bestMatch } from './ip.js';
-import { ValidationError, notFound } from './errors.js';
+import { ValidationError, GuardError, notFound } from './errors.js';
 
 export const TIERS = Object.freeze([1, 2, 3, 4]);
 export const TIER4_DEFAULT_MS = 24 * HOUR;
@@ -30,6 +30,15 @@ function clockOf(env, nowMs) {
 
 function nowOf(rc) {
   return clockOf(rc?.env, rc?.nowMs);
+}
+
+// Tests may LOWER a cap with env.__retention (a function, so a wrangler
+// string var can never set it); nothing can raise one.
+function capOf(env, key, def) {
+  const f = env && env.__retention;
+  if (typeof f !== 'function') return def;
+  const n = toInt(f(key), 1, def);
+  return Number.isFinite(n) ? n : def;
 }
 
 // An allow entry is live only with no expiry or a READABLE one in the future.
@@ -53,23 +62,32 @@ export function entryTier(row) {
   return Number.isFinite(t) ? t : 4;
 }
 
+// EVERY live row, a page at a time by id. A single `LIMIT 10000` read the
+// oldest rows only, so once a list grew past it the newest blocks — shown as
+// active in the console — were never consulted by the gate (fail open).
+async function allLive(env, sql, args) {
+  const out = [];
+  for (let after = 0; ; ) {
+    const { results } = await env.DB.prepare(`${sql} AND id > ? ORDER BY id LIMIT ?`).bind(...args, after, ROW_LIMIT).all();
+    const page = results || [];
+    out.push(...page);
+    if (page.length < ROW_LIMIT) return out;
+    after = page[page.length - 1].id;
+  }
+}
+
 async function liveAllowRows(env, nowMs) {
-  const { results } = await env.DB.prepare('SELECT * FROM allowed_ips WHERE expires_at IS NULL OR expires_at > ? ORDER BY id LIMIT ?')
-    .bind(iso(nowMs), ROW_LIMIT)
-    .all();
-  return (results || []).filter((r) => allowLive(r, nowMs));
+  const rows = await allLive(env, 'SELECT * FROM allowed_ips WHERE (expires_at IS NULL OR expires_at > ?)', [iso(nowMs)]);
+  return rows.filter((r) => allowLive(r, nowMs));
 }
 
 // Rows written here always hold iso() strings; anything not shaped like one
 // is fetched too and judged by blockLive (unreadable → still blocking).
 async function liveBlockRows(env, nowMs) {
-  const { results } = await env.DB.prepare(
-    `SELECT * FROM blocked_ips WHERE expires_at IS NULL OR expires_at > ? OR NOT ${isoShapeSql('expires_at')}
-     ORDER BY id LIMIT ?`,
-  )
-    .bind(iso(nowMs), ROW_LIMIT)
-    .all();
-  return (results || []).filter((r) => blockLive(r, nowMs));
+  const rows = await allLive(env, `SELECT * FROM blocked_ips WHERE (expires_at IS NULL OR expires_at > ? OR NOT ${isoShapeSql('expires_at')})`, [
+    iso(nowMs),
+  ]);
+  return rows.filter((r) => blockLive(r, nowMs));
 }
 
 // ---------------------------------------------------------------- reading
@@ -308,6 +326,11 @@ export async function removeAllowed(rc, id) {
 // ---------------------------------------------------------------- blocklist
 
 // → the inserted row. The self-block guard is guards.js's.
+// The most live blocks the list holds. Every request reads them all, so an
+// import that would pass this is refused with a sentence rather than slowing
+// every page down (and the console still shows each one it lists).
+export const BLOCK_CAP = 10000;
+
 export async function addBlocked(rc, input) {
   const env = rc.env;
   const t = nowOf(rc);
@@ -315,6 +338,14 @@ export async function addBlocked(rc, input) {
   const cidr = validateCidr(i.cidr, { what: 'blocklist' });
   const reason = optText(i.reason, 'reason', 200);
   const exp = validateExpiry(i, t);
+  const cap = capOf(env, 'blocked_ips', BLOCK_CAP);
+  if ((await liveBlockRows(env, t)).length >= cap) {
+    throw new GuardError(
+      'blocklist_full',
+      `The blocklist already holds ${cap.toLocaleString('en-US')} live entries. Remove some, or block a wider range instead, before adding more.`,
+      409,
+    );
+  }
   return env.DB.prepare('INSERT INTO blocked_ips (cidr, reason, expires_at, created_by, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *')
     .bind(cidr, reason, exp === null ? null : iso(exp), actorId(rc), iso(t))
     .first();

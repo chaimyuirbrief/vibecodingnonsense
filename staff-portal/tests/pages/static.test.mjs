@@ -18,7 +18,7 @@
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { test, assert, run } from '../helpers/t.js';
-import { tokenizeHtml, parseHtml, loadPage, reply, PUBLIC_DIR } from '../helpers/dom.js';
+import { tokenizeHtml, parseHtml, loadPage, importFresh, reply, PUBLIC_DIR } from '../helpers/dom.js';
 
 const NAMESPACES = new Set(['http://www.w3.org/2000/svg', 'http://www.w3.org/1999/xlink', 'http://www.w3.org/1999/xhtml', 'http://www.w3.org/XML/1998/namespace']);
 
@@ -318,6 +318,56 @@ test('every form control has a label', () => {
       const ok = (e.attrs.id && forIds.has(e.attrs.id)) || e.attrs['aria-label'] || e.attrs['aria-labelledby'] || e.ancestors.includes('label');
       assert.ok(ok, `${rel(p.file)}: <${e.name} id="${e.attrs.id || ''}"> has no label`);
     }
+  }
+});
+
+test('every <form> in the markup is method=post: one submitted before its script binds must not put the fields in the URL (FE-2)', async () => {
+  // The submit listeners come with a deferred module graph that is fetched on
+  // every visit (no-store). Enter on an autofilled field before it binds is a
+  // native submission; as a GET it would carry the password (or setup key)
+  // into the address bar, history and request logs.
+  let forms = 0;
+  for (const p of pages) {
+    for (const f of p.elements.filter((e) => e.name === 'form')) {
+      forms += 1;
+      assert.equal((f.attrs.method || 'get').toLowerCase(), 'post', `${rel(p.file)}: <form id="${f.attrs.id || ''}"> has no method="post"`);
+      assert.equal(f.attrs.action, undefined, `${rel(p.file)}: <form id="${f.attrs.id || ''}"> names an action; an early submit must go nowhere but its own page`);
+    }
+  }
+  assert.ok(forms >= 11, `found only ${forms} forms`);
+  // Before hydration (the module never imported): the real markup.
+  for (const [file, url, id] of [
+    ['login.html', 'https://staff.example.com/login', 'form-password'],
+    ['setup.html', 'https://staff.example.com/setup', 'form-setup'],
+    ['account.html', 'https://staff.example.com/account', 'password-form'],
+  ]) {
+    const page = await loadPage(file, { url, import: false });
+    assert.equal(page.$(id).getAttribute('method'), 'post', `${file} #${id}`);
+    page.dispose();
+  }
+});
+
+test('every page ships an empty polite live region for toasts, so the first one is announced (FE-6)', async () => {
+  for (const p of pages) {
+    const regions = p.elements.filter((e) => e.attrs.id === 'toasts');
+    assert.equal(regions.length, 1, `${rel(p.file)}: no #toasts region in the markup`);
+    const r = regions[0];
+    assert.equal(r.attrs.role, 'status', rel(p.file));
+    assert.equal(r.attrs['aria-live'], 'polite', rel(p.file));
+    assert.ok((r.attrs.class || '').split(/\s+/).includes('toasts'), rel(p.file));
+    assert.ok(!r.ancestorEls.some((a) => a.attrs.hidden !== undefined), `${rel(p.file)}: #toasts sits inside something hidden`);
+  }
+  for (const file of ['admin.html', 'account.html', 'dashboard.html', 'pending.html']) {
+    const page = await loadPage(file, { url: `https://staff.example.com/${file.replace('.html', '')}`, import: false });
+    const before = page.$('toasts');
+    assert.ok(before, `${file}: the region exists before the first toast`);
+    assert.equal(before.textContent.trim(), '', `${file}: and it is empty`);
+    const { toast } = await importFresh('js/common.js');
+    toast('Saved.', 'ok');
+    assert.equal(page.$('toasts'), before, `${file}: the toast went into the shipped region`);
+    assert.equal(page.document.querySelectorAll('#toasts').length, 1);
+    assert.match(page.text('toasts'), /Saved\./);
+    page.dispose();
   }
 });
 

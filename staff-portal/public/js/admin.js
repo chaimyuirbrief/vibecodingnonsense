@@ -926,22 +926,40 @@ function intOrError(input, { min, max, required = true, label = 'This' }) {
   return { ok: true, value: n };
 }
 
+// A lapsed streak shows 0, but the row still holds the run that lapsed —
+// what an administrator restores from after an outage (SPEC §10.10).
+function lapsedRun(s) {
+  return s && s.state === 'lapsed' && typeof s.stored_current === 'number' && s.stored_current > 0 ? s.stored_current : 0;
+}
+
+// What Adjust starts from: the lapsed run, or what is showing.
+function restoreFrom(s) {
+  return str(lapsedRun(s) || s.current);
+}
+
+function lapsedHint(s) {
+  const was = lapsedRun(s);
+  return was ? `It was ${plural(was, 'day')} when it lapsed.` : '';
+}
+
 function streakCard(st, user, base, area) {
   const s = st && typeof st === 'object' ? st : null;
+  const was = lapsedRun(s);
   const facts = s
     ? h('dl', { class: 'kv' }, [
         h('dt', null, 'State'), h('dd', null, STREAK_STATE_LABELS[s.state] || humanize(s.state) || '—'),
         h('dt', null, 'Current'), h('dd', null, plural(s.current || 0, 'day')),
+        was ? [h('dt', null, 'Before it lapsed'), h('dd', null, plural(was, 'day'))] : null,
         h('dt', null, 'Longest'), h('dd', null, plural(s.longest || 0, 'day')),
         h('dt', null, 'Last day'), h('dd', null, s.last_day ? dayLabel(s.last_day, { year: true }) : '—'),
       ])
     : h('p', { class: 'muted' }, 'No streak yet.');
   let form = null;
   if (can('streaks.manage')) {
-    const cur = h('input', { id: 'streak-current', type: 'text', inputmode: 'numeric', value: s ? str(s.current) : '' });
+    const cur = h('input', { id: 'streak-current', type: 'text', inputmode: 'numeric', value: s ? restoreFrom(s) : '' });
     const lon = h('input', { id: 'streak-longest', type: 'text', inputmode: 'numeric', value: s ? str(s.longest) : '' });
     const why = h('input', { id: 'streak-reason', type: 'text', maxlength: 200, placeholder: 'e.g. Portal outage on Oct 1' });
-    form = h('form', { class: 'form-grid', novalidate: true }, field('Current', cur), field('Longest', lon, 'Leave empty to keep it.'), field('Reason', why, 'Recorded in the audit log.', { wide: true }), h('div', { class: 'field' }, submitBtn('streaks.manage', 'Adjust streak', { kind: 'secondary' })));
+    form = h('form', { class: 'form-grid', novalidate: true }, field('Current', cur, lapsedHint(s)), field('Longest', lon, 'Leave empty to keep it.'), field('Reason', why, 'Recorded in the audit log.', { wide: true }), h('div', { class: 'field' }, submitBtn('streaks.manage', 'Adjust streak', { kind: 'secondary' })));
     form.addEventListener('submit', (e) => {
       e.preventDefault();
       for (const i of [cur, lon, why]) setFieldError(i, '');
@@ -2236,7 +2254,7 @@ async function loadStreaks(body) {
                   { dataset: { userId: s.user_id } },
                   h('td', { 'data-label': 'Person' }, personName(s)),
                   h('td', { 'data-label': 'State' }, badge(STREAK_STATE_LABELS[s.state] || humanize(s.state) || '—', s.state === 'at_risk' ? 'warn' : s.state === 'active' ? 'flame' : s.state === 'paused' || s.state === 'held' ? 'rest' : 'neutral')),
-                  h('td', { 'data-label': 'Current', class: 'num' }, fmtNumber(typeof s.current === 'number' ? s.current : 0)),
+                  h('td', { 'data-label': 'Current', class: 'num' }, fmtNumber(typeof s.current === 'number' ? s.current : 0), lapsedRun(s) ? h('span', { class: 'muted' }, ` (was ${fmtNumber(lapsedRun(s))})`) : null),
                   h('td', { 'data-label': 'Longest', class: 'num' }, fmtNumber(typeof s.longest === 'number' ? s.longest : 0)),
                   h('td', { 'data-label': 'Last day' }, s.last_day ? dayLabel(s.last_day) : '—'),
                   can('streaks.manage') ? h('td', { 'data-label': '' }, writeBtn('streaks.manage', 'Adjust', () => adjustStreak(area, s), { ariaLabel: `Adjust ${personName(s)}’s streak` })) : null,
@@ -2253,12 +2271,12 @@ async function loadStreaks(body) {
 
 function adjustStreak(area, s) {
   return new Promise((resolve) => {
-    const cur = h('input', { id: 'adjust-current', type: 'text', inputmode: 'numeric', value: str(s.current) });
+    const cur = h('input', { id: 'adjust-current', type: 'text', inputmode: 'numeric', value: restoreFrom(s) });
     const lon = h('input', { id: 'adjust-longest', type: 'text', inputmode: 'numeric', value: str(s.longest) });
     const why = h('input', { id: 'adjust-reason', type: 'text', maxlength: 200 });
     const save = h('button', { type: 'button', class: 'btn btn-primary', dataset: { write: 'streaks.manage' } }, 'Adjust');
     const cancel = h('button', { type: 'button', class: 'btn btn-secondary' }, 'Cancel');
-    const m = modal({ title: `Adjust ${personName(s)}’s streak`, body: [field('Current', cur), field('Longest', lon, 'Leave empty to keep it.'), field('Reason', why, 'Recorded in the audit log.')], actions: [cancel, save], onClose: () => resolve() });
+    const m = modal({ title: `Adjust ${personName(s)}’s streak`, body: [field('Current', cur, lapsedHint(s)), field('Longest', lon, 'Leave empty to keep it.'), field('Reason', why, 'Recorded in the audit log.')], actions: [cancel, save], onClose: () => resolve() });
     cancel.addEventListener('click', () => m.close(false));
     save.addEventListener('click', () =>
       busy(save, async () => {

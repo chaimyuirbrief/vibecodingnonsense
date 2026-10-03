@@ -405,7 +405,7 @@ test('shellAllows: exactly the CONTRACTS §7.8 table', () => {
       'POST /api/auth/login', 'POST /api/auth/mfa/code', 'POST /api/auth/mfa/send', 'POST /api/auth/mfa/otp',
       'POST /api/auth/mfa/passkey/options', 'POST /api/auth/mfa/passkey/verify',
     ],
-    invite: ['GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'GET /api/invite/Abc_-123xyz', 'POST /api/invite/accept', 'POST /api/fp'],
+    invite: ['GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'GET /api/invite/Abc_-123xyz', 'POST /api/invite/lookup', 'POST /api/invite/accept', 'POST /api/fp'],
     pending: ['GET /pending', 'GET /js/pending.js', 'GET /api/device/status', 'GET /api/diag'],
   };
   const everything = new Set(Object.values(table).flat());

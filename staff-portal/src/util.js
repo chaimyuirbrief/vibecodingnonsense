@@ -139,6 +139,24 @@ export function normUsername(v) {
   return USERNAME_RE.test(s) ? s : null;
 }
 
+// A request path as it may be stored in the visit log or an audit detail.
+// An invitation token is a credential (SPEC §13.6) and the invitation lookup
+// carries it in the path, so that segment is replaced with ':token' — as is
+// any other segment long enough to be a 256-bit token (43 base64url
+// characters), wherever a mistyped or forwarded link put it.
+const INVITE_PATH_RE = /^\/api\/invite\/(?!(?:accept|lookup)$)[^/]+/;
+const TOKENISH_SEGMENT_RE = /^[A-Za-z0-9_-]{40,}$/;
+
+export function loggablePath(path) {
+  if (typeof path !== 'string') return '';
+  return path
+    .slice(0, 2048)
+    .replace(INVITE_PATH_RE, '/api/invite/:token')
+    .split('/')
+    .map((seg) => (TOKENISH_SEGMENT_RE.test(seg) ? ':token' : seg))
+    .join('/');
+}
+
 // Only for the few server-built HTML strings (decoy 404). Pages never take
 // HTML strings — they build DOM nodes.
 export function escapeHtml(s) {

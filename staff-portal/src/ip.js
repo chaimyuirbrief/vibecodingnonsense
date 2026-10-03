@@ -187,6 +187,20 @@ export function normalizeIp(s) {
   return a ? formatAddr(a) : null;
 }
 
+// The network a per-address rate limit is keyed on (SPEC §6.4): an IPv4
+// address is itself, an IPv6 address is its /64. One home line or one server
+// is handed a whole /64, so keying on the full address would give it 2^64
+// buckets and no brake at all. → '81.2.69.142' | '2a02:1210:5c00:9e00::/64'
+// | null (unreadable).
+export function rateLimitNetwork(s) {
+  const a = parseIp(s);
+  if (!a) return null;
+  if (a.v === 4) return formatAddr(a);
+  const net = new Uint8Array(16);
+  net.set(a.bytes.subarray(0, 8));
+  return `${formatV6(net)}/64`;
+}
+
 // A bare address is its own full-length range.
 export function parseCidr(s) {
   try {

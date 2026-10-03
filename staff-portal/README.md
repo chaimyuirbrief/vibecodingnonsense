@@ -136,11 +136,12 @@ every visit's risk score. Local is more permissive than production in other
 ways too (SPEC §14.6): PBKDF2 above 100,000 iterations works locally and
 fails in production. A passing local run is evidence, not proof.
 
-One thing goes the other way: local D1 enforces D1's real limits, which the
-node test suite does not (it runs on `node:sqlite`). A LIKE or GLOB pattern
-over 50 bytes fails with `LIKE or GLOB pattern too complex`, and a statement
-with more than 100 bound parameters fails with `too many SQL variables`. After
-changing SQL, walk the affected screens under `npm run dev`.
+One thing goes the other way: local D1 enforces D1's real limits, which plain
+`node:sqlite` does not. A LIKE or GLOB pattern over 50 bytes fails with
+`LIKE or GLOB pattern too complex`, and a statement with more than 100 bound
+parameters fails with `too many SQL variables`. The test suite's D1 stand-in
+(`tests/helpers/d1.js`) now refuses both too, but it only sees the queries the
+tests make: after changing SQL, walk the affected screens under `npm run dev`.
 
 ## Deploy
 
@@ -171,9 +172,10 @@ changing SQL, walk the affected screens under `npm run dev`.
    npx wrangler secret put RESEND_API_KEY
    ```
 
-   Until `SESSION_SECRET` and `DATA_KEY` exist, every page is an empty 503 and
-   only `/healthz` answers. Treat `DATA_KEY` as permanent: rotating it makes
-   every enrolled authenticator app stop working (SPEC §13.3).
+   Until `SESSION_SECRET` and `DATA_KEY` exist (at least 32 characters each,
+   and different), every page is an empty 503 and only `/healthz` answers.
+   Treat `DATA_KEY` as permanent: rotating it makes every enrolled
+   authenticator app stop working (SPEC §13.3).
 
 4. **Check, test and dry-run:**
 
@@ -227,7 +229,7 @@ both, or the path doubles. A dashboard "retry" rebuilds the same commit.
    calendar, device approval, and the access mode (default `allowlist`).
 
 **If you get a blank page:** `/healthz` answers `ok` when the worker is up. An
-empty 503 means a secret is missing; an empty 403 (or a 404, if you chose the
+empty 503 means a secret is missing, too short or reused; an empty 403 (or a 404, if you chose the
 decoy) means the gate does not trust you from where you are. SPEC §13.5 has the
 full checklist.
 
@@ -239,10 +241,12 @@ npm test -- streak                # only suites whose path contains "streak"
 TEST_ONLY=deadline npm test -- streak   # only tests whose name contains "deadline"
 ```
 
-Suites live in `tests/unit`, `tests/e2e` and `tests/pages`. They run against
-real SQLite behind D1's interface, drive the worker's real `fetch` handler
-with a cookie jar and a fake clock, and test page scripts against a minimal
-DOM. Each suite runs in its own process, and the runner reports one line per
+Suites live in `tests/unit`, `tests/e2e`, `tests/pages` and
+`tests/integration`. They run against real SQLite behind D1's interface (with
+D1's parameter and pattern limits enforced), drive the worker's real `fetch`
+handler with a cookie jar and a fake clock, test page scripts against a
+minimal DOM, and — in `tests/integration` — run the real pages against the
+real worker through that DOM, so a page and the API cannot drift apart. Each suite runs in its own process, and the runner reports one line per
 suite:
 
 ```
@@ -271,7 +275,7 @@ staff-portal/
     mfa/  webauthn/     second factors and passkey verification
   public/               one HTML page each, /css/app.css, /js/<page>.js
   scripts/              bundle-check.mjs
-  tests/                unit, e2e, pages, helpers, run.mjs
+  tests/                unit, e2e, pages, integration, helpers, run.mjs
   docs/CONTRACTS.md     exact exports, routes, response shapes, settings
   SPEC.md               the design, the reasoning, the traps
 ```

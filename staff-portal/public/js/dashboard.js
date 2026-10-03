@@ -10,7 +10,8 @@
 // page (the server redirects), but if /api/me says pinned we follow it too.
 //
 // The pure helpers are exported for the tests: heroView, buildStrip,
-// stripSummary, groupRuns, runLabel, recentSignIns, hoursLeftText, zoneLabel.
+// stripSummary, localDayOf, groupRuns, runLabel, recentSignIns,
+// hoursLeftText, zoneLabel.
 
 import {
   $,
@@ -225,11 +226,28 @@ function levelFor(run) {
   return 1;
 }
 
+// The calendar day ('YYYY-MM-DD') an instant falls on in the portal's zone —
+// the zone the history's days are counted in — or null.
+export function localDayOf(value, tz) {
+  const d = typeof value === 'string' && value ? new Date(value) : null;
+  if (!d || !Number.isFinite(d.getTime()) || typeof tz !== 'string' || !tz) return null;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', calendar: 'gregory', numberingSystem: 'latn' }).formatToParts(d);
+    const part = (type) => (parts.find((p) => p.type === type) || {}).value;
+    const day = `${part('year')}-${part('month')}-${part('day')}`;
+    return parseDay(day) ? day : null;
+  } catch {
+    return null;
+  }
+}
+
 // 84 cells, GitHub-style: 12 columns of Sunday→Saturday weeks, oldest on the
 // left, the current week last, so the days after today are still to come.
 // A counted day's warmth follows the length of the run it belongs to;
-// protected days bridge a run, as they do in the streak itself.
-export function buildStrip(history) {
+// protected days bridge a run, as they do in the streak itself. Days before
+// `since` (the person's first day) were never theirs to miss: they are drawn
+// as "before you joined", not missed and not protected.
+export function buildStrip(history, { since = null } = {}) {
   const list = (Array.isArray(history) ? history : []).filter((e) => e && typeof e === 'object' && parseDay(e.day));
   if (!list.length) return null;
   list.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
@@ -239,6 +257,8 @@ export function buildStrip(history) {
   const startMs = today.ms - (today.weekday + 77) * DAY_MS;
   const firstMs = Math.min(parseDay(list[0].day).ms, startMs);
 
+  const joined = typeof since === 'string' && parseDay(since) ? since : null;
+
   const cells = [];
   let run = 0;
   for (let ms = firstMs; ms < startMs + GRID_DAYS * DAY_MS; ms += DAY_MS) {
@@ -247,7 +267,8 @@ export function buildStrip(history) {
     const isToday = ms === today.ms;
     const future = ms > today.ms;
     const counted = !future && !!e && e.counted === true;
-    const prot = !future && !!e && e.protected === true;
+    const before = !future && !counted && !isToday && joined !== null && day < joined;
+    const prot = !future && !before && !!e && e.protected === true;
     if (counted) run += 1;
     else if (!prot && !isToday && !future) run = 0;
     if (ms < startMs) continue;
@@ -262,6 +283,10 @@ export function buildStrip(history) {
       classes.push('is-future');
       label = `${date}: still to come`;
       kind = 'future';
+    } else if (before) {
+      classes.push('is-before');
+      label = `${date}: before you joined`;
+      kind = 'before';
     } else {
       if (counted) classes.push('is-counted', `lvl-${levelFor(run)}`);
       if (prot) classes.push('is-protected');
@@ -281,7 +306,7 @@ export function buildStrip(history) {
         label = `${date}: missed`;
       }
     }
-    cells.push({ day, kind, classes, label, names, today: isToday, protected: prot, counted, future });
+    cells.push({ day, kind, classes, label, names, today: isToday, protected: prot, counted, future, before });
   }
   return { today: todayEntry.day, start: isoDay(startMs), cells };
 }
@@ -292,13 +317,14 @@ export function stripSummary(strip) {
   let open = 0;
   let protectedDays = 0;
   for (const c of strip.cells) {
-    if (c.future) continue;
+    if (c.future || c.before) continue;
     if (c.counted) {
       signed += 1;
       open += 1;
     } else if (c.protected) protectedDays += 1;
     else if (!c.today) open += 1;
   }
+  if (!open) return protectedDays ? `No open days to count yet. ${plural(protectedDays, 'protected day')} didn’t count against you.` : 'No open days to count yet.';
   const head = `Signed in on ${fmtNumber(signed)} of the last ${plural(open, 'open day')}`;
   return protectedDays ? `${head}. ${plural(protectedDays, 'protected day')} didn’t count against you.` : `${head}.`;
 }
@@ -316,9 +342,10 @@ function monthLabels(strip) {
   return out;
 }
 
-function renderStrip(history) {
-  const strip = buildStrip(history);
+function renderStrip(history, since) {
+  const strip = buildStrip(history, { since });
   const grid = $('strip');
+  $('legend-before').hidden = !(strip && strip.cells.some((c) => c.before));
   if (!strip) {
     grid.replaceChildren();
     $('strip-months').replaceChildren();
@@ -516,7 +543,8 @@ function renderStreak(data, me) {
     $('leaderboard-card').hidden = true;
     return;
   }
-  renderStrip(data.history);
+  const tz = data.status && typeof data.status.timezone === 'string' ? data.status.timezone : me && me.timezone;
+  renderStrip(data.history, localDayOf(me && me.user ? me.user.created_at : null, tz));
   renderUpcoming(data.upcoming);
   $('rules').textContent = streakRulesSentence(data.rules) || 'The rules couldn’t be read.';
   renderLeaderboard(data.leaderboard, me && me.user ? me.user.id : null);

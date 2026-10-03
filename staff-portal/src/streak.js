@@ -10,7 +10,7 @@
 // { prior, row } for the API handler to audit.
 
 import { toInt, iso, parseIsoStrict, safeJsonParse, MINUTE, HOUR, DAY } from './util.js';
-import { ValidationError, notFound } from './errors.js';
+import { ValidationError, GuardError, notFound } from './errors.js';
 import {
   dayString,
   parseDayString,
@@ -196,12 +196,18 @@ export function computeDeadline(lastAtMs, cfg) {
     for (let i = 1; i <= span; i++) p[i] = prot(c, fromDay + i).protected;
     let count = 0;
     let closed = null;
+    // Each leeway day adds its REAL length — 23 or 25 hours across a clock
+    // change — so a sign-in just before a block and one just inside it (whose
+    // window opens at the block's real end, above) agree to the minute: the
+    // clock does not run in protected time, whatever the clocks do (B §8).
+    let leewayMs = 0;
     for (let i = 1; i <= span; i++) {
       if (!p[i]) continue;
       count++;
+      if (count <= c.maxLeewayDays) leewayMs += dayLength(fromDay + i, c.tz);
       if (i < span && !p[i + 1]) closed = fromDay + i; // a block that ends inside the window
     }
-    const byCount = base + Math.min(count, c.maxLeewayDays) * DAY;
+    const byCount = base + leewayMs;
     let next = byCount;
     if (closed !== null && c.graceHours > 0) {
       // Re-entry grace (B §8): nobody loses a run because a block ended just
@@ -219,6 +225,13 @@ export function computeDeadline(lastAtMs, cfg) {
   // the sign-in itself fell inside (why the window opened late), or null.
   const opening = anchor > lastAt ? blocksIn(c, lastDay - 1, fromDay)[0] || null : null;
   return { deadline, base, leewayDays, graceApplied, blocks: blocksIn(c, fromDay, localDay(deadline, c.tz)), opening, anchor, rounds };
+}
+
+// The real length of local day `rd` in ms; a day whose midnights cannot be
+// read is a plain 24 hours.
+function dayLength(rd, tz) {
+  const len = zonedMidnightUtc(rd + 1, tz) - zonedMidnightUtc(rd, tz);
+  return Number.isFinite(len) && len > 0 ? len : DAY;
 }
 
 function blocksIn(c, lastDay, endDay) {
@@ -371,8 +384,10 @@ async function afterLostRace(db, uid, now, nowIso) {
 
 // Called by completeSignIn only. NEVER throws: a streak is decoration and
 // must not block a sign-in (A §10) — any failure resolves to null. Returns
-// null too when streaks are disabled (nothing is recorded).
-export async function touchStreak(env, userId, nowMs, cfg) {
+// null too when streaks are disabled (nothing is recorded). The failure is
+// handed to opts.onError, so the caller records the REAL exception in the
+// audit log (CONTRACTS §0.4) — this module never imports audit.js.
+export async function touchStreak(env, userId, nowMs, cfg, opts = {}) {
   try {
     const uid = toInt(userId, 1);
     const now = finite(nowMs);
@@ -420,8 +435,37 @@ export async function touchStreak(env, userId, nowMs, cfg) {
         else if (unreadable) repaired = 'unreadable_last_at';
       } else if (lastAt > now + FUTURE_HOLD_MS) {
         return streakStatus(row, now, c); // held: change nothing (A §11)
-      } else if (lastDayRd >= todayRd) {
-        await bumpLastAt(db, row, now, nowIso); // same day (or a zone change put today behind last_day)
+      } else if (lastDayRd > todayRd) {
+        await bumpLastAt(db, row, now, nowIso); // a zone change put today behind last_day
+      } else if (lastDayRd === todayRd) {
+        // Same day. Usually last_at moves and nothing else — but a real
+        // sign-in is always LOGGED: an administrator's adjustment claims today
+        // without a streak_days row, so the first sign-in of the day writes it
+        // and counts it in total_days. And a stored current of 0 (set to 0
+        // today) restarts at 1, as "your next sign-in starts a new streak" says.
+        const restart = cur <= 0 ? 1 : 0;
+        const res = await db.batch([
+          db
+            .prepare(
+              `UPDATE streaks SET
+                 total_days = total_days + (NOT EXISTS (SELECT 1 FROM streak_days WHERE user_id = ? AND day = ?)),
+                 current = CASE WHEN ? THEN 1 ELSE current END,
+                 longest = CASE WHEN ? THEN MAX(longest, 1) ELSE longest END,
+                 started_day = CASE WHEN ? THEN ? ELSE started_day END,
+                 last_at = CASE WHEN last_at < ? THEN ? ELSE last_at END,
+                 updated_at = ?
+               WHERE user_id = ? AND last_day IS ? AND last_at IS ? AND current IS ?`,
+            )
+            .bind(uid, today, restart, restart, restart, today, nowIso, nowIso, nowIso, uid, row.last_day, row.last_at, row.current),
+          db
+            .prepare(
+              `INSERT INTO streak_days (user_id, day, first_at)
+               SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM streaks WHERE user_id = ? AND last_day = ?)
+               ON CONFLICT(user_id, day) DO NOTHING`,
+            )
+            .bind(uid, today, nowIso, uid, today),
+        ]);
+        if (changes(res[0]) === 0) await afterLostRace(db, uid, now, nowIso);
       } else {
         const continues = now <= computeDeadline(lastAt, c).deadline;
         const current = continues ? cur + 1 : 1;
@@ -447,6 +491,13 @@ export async function touchStreak(env, userId, nowMs, cfg) {
     return status;
   } catch (e) {
     console.error('[streak] touch failed:', e && e.message ? e.message : e);
+    if (typeof opts?.onError === 'function') {
+      try {
+        await opts.onError(e);
+      } catch {
+        /* the reporter must not turn a swallowed failure into a thrown one */
+      }
+    }
     return null;
   }
 }
@@ -590,18 +641,46 @@ function dayOrNullOk(v) {
   return v === null || dayOrNull(v) !== null;
 }
 
+// The columns an adjustment writes and a restore compares.
+export const STREAK_FIELDS = Object.freeze(['current', 'longest', 'total_days', 'started_day', 'last_day', 'last_at']);
+
+function changedSince() {
+  return new GuardError(
+    'changed_since',
+    'Their streak has changed since then — they signed in, or it was adjusted again — so putting the old one back would wipe what they earned. Adjust it by hand instead.',
+    409,
+  );
+}
+
+// Matches the live row exactly as read, so a sign-in landing between the
+// read and the write makes the write change nothing.
+const UNCHANGED = STREAK_FIELDS.map((k) => `${k} IS ?`).join(' AND ');
+
 // The reverter for undo kind 'streak' (§4.2.1): put the prior row back, or
 // delete the row when there was none. The snapshot is re-validated because it
 // came out of storage. Returns { prior: the row it replaced, row }.
-export async function restoreStreak(env, userId, prior, nowMs) {
+//
+// opts.expect: the columns the adjustment being undone wrote. Unless the live
+// row still holds exactly those, the person has signed in (or been adjusted)
+// since, and the snapshot would silently overwrite the days they earned —
+// total_days included, which nothing else can set back (SPEC §10.18). So the
+// restore is refused (409 changed_since), as an 'mfa.reset' revert is when
+// they have enrolled since.
+export async function restoreStreak(env, userId, prior, nowMs, opts = {}) {
   const uid = toInt(userId, 1);
   if (Number.isNaN(uid)) throw new ValidationError('Choose a person.', 'user_id');
   const now = finite(nowMs);
   if (Number.isNaN(now)) throw new Error('restoreStreak: unusable clock');
   const db = env.DB;
   const before = await readRow(db, uid);
+  const expect = opts && typeof opts.expect === 'object' && opts.expect !== null ? opts.expect : null;
+  if (expect && (!before || STREAK_FIELDS.some((k) => expect[k] !== undefined && expect[k] !== before[k]))) throw changedSince();
+  const asRead = before ? STREAK_FIELDS.map((k) => before[k]) : null;
   if (prior === null || prior === undefined) {
-    await db.prepare('DELETE FROM streaks WHERE user_id = ?').bind(uid).run();
+    const del = before
+      ? await db.prepare(`DELETE FROM streaks WHERE user_id = ? AND ${UNCHANGED}`).bind(uid, ...asRead).run()
+      : null;
+    if (expect && changes(del) !== 1) throw changedSince();
     return { prior: before || null, row: null };
   }
   const p = typeof prior === 'object' && !Array.isArray(prior) ? prior : {};
@@ -615,15 +694,19 @@ export async function restoreStreak(env, userId, prior, nowMs) {
     throw new ValidationError('That streak snapshot is unreadable.');
   }
   const t = iso(now);
-  await db
-    .prepare(
-      `INSERT INTO streaks (${COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET current = excluded.current, longest = excluded.longest,
-         total_days = excluded.total_days, started_day = excluded.started_day, last_day = excluded.last_day,
-         last_at = excluded.last_at, updated_at = excluded.updated_at`,
-    )
-    .bind(uid, cur, lon, tot, started, lastDay, lastAt, t)
-    .run();
+  const res = asRead
+    ? await db
+        .prepare(
+          `UPDATE streaks SET current = ?, longest = ?, total_days = ?, started_day = ?, last_day = ?, last_at = ?, updated_at = ?
+           WHERE user_id = ? AND ${UNCHANGED}`,
+        )
+        .bind(cur, lon, tot, started, lastDay, lastAt, t, uid, ...asRead)
+        .run()
+    : await db
+        .prepare(`INSERT INTO streaks (${COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING`)
+        .bind(uid, cur, lon, tot, started, lastDay, lastAt, t)
+        .run();
+  if (changes(res) !== 1) throw changedSince();
   return { prior: before || null, row: await readRow(db, uid) };
 }
 

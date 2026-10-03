@@ -4,7 +4,7 @@
 
 import { test, assert, run } from '../helpers/t.js';
 import {
-  freshEnv, bootstrap, makeUser, stepUp, roleId, q, count, auditRows, advance, MINUTE, DAY, nowIso,
+  freshEnv, bootstrap, makeUser, stepUp, client, roleId, q, count, auditRows, advance, setSetting, MINUTE, DAY, nowIso,
 } from '../helpers/flows.js';
 import { Router } from '../../src/router.js';
 import * as adminApi from '../../src/api/admin.js';
@@ -220,6 +220,57 @@ test('danger routes demand a step-up, and the window expires after step_up_minut
   assert.equal(stale.body.step_up_required, true);
   await stepUp(env, owner.client);
   await owner.client.put('/api/admin/settings', { changes: { step_up_minutes: 15 } });
+});
+
+// Giving an existing person a danger role takes users.roles and a step-up.
+// Creating a person WITH one — an invitation, an approved access request, a
+// new link for someone still invited — is the same outcome, so it takes the
+// step-up too; otherwise a stale (or stolen, idle-valid) session mints a
+// Super Admin of its own (SPEC §5.5, §7.9).
+test('minting an account into a danger role needs a step-up — invitation, approved request and new link alike', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  setSetting(env, 'access_mode', 'request_access');
+  const c = owner.client;
+  const emp = await makeUser(env, c, { role: 'employee' });
+  // An Administrator invited while the owner was fresh, still to accept.
+  const pendingAdmin = await c.post('/api/admin/users', { email: 'adam@acme.com', full_name: 'Adam Admin', role_id: roleId(env, 'admin') });
+  assert.equal(pendingAdmin.status, 200, pendingAdmin.text);
+  const pendingEmp = await c.post('/api/admin/users', { email: 'eve@acme.com', full_name: 'Eve Employee' });
+  assert.equal(pendingEmp.status, 200, pendingEmp.text);
+  for (const email of ['walkin@example.org', 'other@example.org']) {
+    assert.equal((await client(env).post('/api/access-request', { email, full_name: 'Walk In' })).status, 200);
+  }
+  const reqId = (email) => q(env, 'SELECT id FROM access_requests WHERE email = ?', email)[0].id;
+  advance(env, 20 * MINUTE); // stale step-up, live session
+
+  const promote = await c.post(`/api/admin/users/${emp.user.id}/role`, { role_id: roleId(env, 'super_admin') });
+  assert.equal(promote.body.step_up_required, true, 'control: the role change asks');
+  for (const key of ['super_admin', 'admin']) {
+    const r = await c.post('/api/admin/users', { email: `new.${key}@evil.example`, full_name: 'New', role_id: roleId(env, key) });
+    assert.equal(r.status, 403, `${key}: ${r.text}`);
+    assert.equal(r.body.step_up_required, true);
+    assert.equal(r.body.invitation, undefined, 'no link');
+  }
+  const ap = await c.post(`/api/admin/requests/${reqId('walkin@example.org')}/approve`, { role_id: roleId(env, 'super_admin') });
+  assert.equal(ap.status, 403, ap.text);
+  assert.equal(ap.body.step_up_required, true);
+  assert.equal(q(env, 'SELECT status FROM access_requests WHERE id = ?', reqId('walkin@example.org'))[0].status, 'pending');
+  const re = await c.post(`/api/admin/users/${pendingAdmin.body.user.id}/invitation`, {});
+  assert.equal(re.status, 403, re.text);
+  assert.equal(re.body.step_up_required, true);
+  assert.equal(count(env, "SELECT COUNT(*) FROM users WHERE email LIKE 'new.%'"), 0, 'nobody was created');
+
+  // Roles with nothing dangerous in them stay one click.
+  assert.equal((await c.post('/api/admin/users', { email: 'emma@acme.com', full_name: 'Emma' })).status, 200);
+  assert.equal((await c.post('/api/admin/users', { email: 'aud@acme.com', full_name: 'Aud', role_id: roleId(env, 'auditor') })).status, 200);
+  assert.equal((await c.post(`/api/admin/requests/${reqId('other@example.org')}/approve`, {})).status, 200);
+  assert.equal((await c.post(`/api/admin/users/${pendingEmp.body.user.id}/invitation`, {})).status, 200);
+
+  // With a fresh step-up, the danger roles are minted as before.
+  await stepUp(env, c);
+  assert.equal((await c.post('/api/admin/users', { email: 'sue@acme.com', full_name: 'Sue', role_id: roleId(env, 'super_admin') })).status, 200);
+  assert.equal((await c.post(`/api/admin/users/${pendingAdmin.body.user.id}/invitation`, {})).status, 200);
 });
 
 test('reserved routes refuse an administrator holding every grantable permission plus a temporary role', async () => {

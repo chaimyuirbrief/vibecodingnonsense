@@ -34,6 +34,14 @@ export const HOW = Object.freeze({
   setup: 'the setup page',
 });
 
+// The login_id subject for a device that has signed in to the account
+// before (D6): its own bucket, so a stranger spending the account's bucket
+// cannot keep the owner out of their own laptop. Cleared on success with the
+// other per-account counters.
+export function knownDeviceLoginSubject(userId, deviceId) {
+  return `user:${userId}|device:${deviceId}`;
+}
+
 export function pinTarget(pin) {
   return pin ? `/account?pin=${encodeURIComponent(pin)}` : '/';
 }
@@ -80,6 +88,7 @@ export async function completeSignIn(rc, user, how, opts = {}) {
   for (const subject of [fresh.email, fresh.username]) {
     if (typeof subject === 'string' && subject) await clear(env, 'login_id', subject.toLowerCase());
   }
+  await clear(env, 'login_id', knownDeviceLoginSubject(uid, dev.id));
   await clear(env, 'mfa_user', String(uid));
   await clearLoginFailures(env, uid);
 
@@ -93,10 +102,14 @@ export async function completeSignIn(rc, user, how, opts = {}) {
   });
 
   // 8. Decoration: never blocks a sign-in (A §10). touchStreak never throws;
-  // the guard is for streakConfig and the audit call around it.
+  // it hands its failure to onError so the real exception reaches the audit
+  // log (CONTRACTS §0.4). The guard is for streakConfig and the audit calls.
   let streak = null;
+  const streakTarget = { type: 'user', id: uid };
   try {
-    streak = await touchStreak(env, uid, t, streakConfig(rc.policy));
+    streak = await touchStreak(env, uid, t, streakConfig(rc.policy), {
+      onError: (e) => auditError(actx, 'streak.error', e, { target: streakTarget, detail: 'Could not count today’s sign-in toward the streak.' }),
+    });
     if (streak && streak.repaired) {
       await audit(actx, {
         action: 'streak.error',

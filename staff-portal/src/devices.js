@@ -11,6 +11,11 @@
 import { cookie, iso, now, toInt, str, strStrict, parseIsoStrict, randomToken, DAY, HOUR } from './util.js';
 import { signToken, verifyToken, sha256 } from './crypto.js';
 import { ValidationError, GuardError, notFound } from './errors.js';
+import { effectivePermissions, assertCanActOn } from './rbac.js';
+import { actorAuthz } from './users.js';
+// gate.js imports this module too; evaluateGate is only called at request
+// time, never while either module is being evaluated.
+import { evaluateGate } from './gate.js';
 
 export const DEVICE_COOKIE = '__Host-dev';
 export const DEVICE_STATUSES = Object.freeze(['pending', 'approved', 'blocked']);
@@ -343,17 +348,48 @@ async function loadDevice(env, deviceId) {
   return row;
 }
 
-function gatingMayBeOn(rc) {
-  return rc?.policy?.device_gating !== false;
+// Withdrawing trust from the device you are using locks you out of it at
+// once (blocked) or on the next request (pending) whenever the gate needs
+// that approval to let you in — device gating, but also lockdown, invite_only
+// and the allowlist mode off the allowlist (B trap 8). So the gate itself is
+// asked: this very request, with the device as it would be. Anything short of
+// 'all' — or a gate that cannot answer — refuses.
+async function assertNotOwnDevice(rc, prior, next) {
+  if (rc?.device?.id !== prior.id) return;
+  if (next === 'blocked') throw new GuardError('self_lockout', 'You can’t block the device you’re using.', 409);
+  const verdict = await evaluateGate({ ...rc, device: { id: prior.id, row: { ...prior, status: next } } });
+  if (verdict.allowed !== 'all') {
+    throw new GuardError(
+      'self_lockout',
+      'The portal needs this device’s approval to let you in, so this would lock you out of the device you’re using. Do it from another approved device.',
+      409,
+    );
+  }
 }
 
-// Withdrawing trust from the device you are using locks you out of it at
-// once (blocked) or on the next request (pending, with gating on) — B trap 8.
-function assertNotOwnDevice(rc, deviceId, next) {
-  if (rc?.device?.id !== deviceId) return;
-  if (next === 'blocked') throw new GuardError('self_lockout', 'You can’t block the device you’re using.', 409);
-  if (next === 'pending' && gatingMayBeOn(rc)) {
-    throw new GuardError('self_lockout', 'Device approval is on, so this would lock you out of the device you’re using. Do it from another approved device.', 409);
+// Withdrawing trust from a device ends every session on it and, wherever
+// approval matters, keeps out everyone who signs in there — so it is an
+// action on each of them. Like ending their sessions directly, it needs
+// every active account that has signed in on the device to rank below the
+// caller (Super Admins are peers; your own accounts are yours) — SPEC §5.5.
+async function assertCanActOnDeviceUsers(rc, deviceId) {
+  const env = rc.env;
+  const { results } = await env.DB.prepare(
+    `SELECT u.id, u.role_id, u.perm_grants, u.perm_denies, u.status FROM device_users du
+     JOIN users u ON u.id = du.user_id WHERE du.device_id = ? AND u.status = 'active'`,
+  )
+    .bind(deviceId)
+    .all();
+  if (!results.length) return;
+  const actor = await actorAuthz(rc);
+  const t = nowOf(rc);
+  for (const u of results) {
+    try {
+      assertCanActOn(actor, await effectivePermissions(env, u, t), { allowSelf: true });
+    } catch (e) {
+      if (!(e instanceof GuardError)) throw e;
+      throw new GuardError('rank', 'Someone ranked at or above you signs in on this device, so only they or someone above them can do that.');
+    }
   }
 }
 
@@ -383,7 +419,13 @@ export async function setDeviceStatus(rc, deviceId, status, opts = {}) {
   const db = env.DB;
   const t = nowOf(rc);
   const prior = await loadDevice(env, deviceId);
-  assertNotOwnDevice(rc, prior.id, status);
+  // Blocking, or taking back an approval, withdraws trust; approving and
+  // unblocking only extend it.
+  const withdraws = status === 'blocked' || (status === 'pending' && deviceState(prior) === 'approved');
+  if (withdraws) {
+    await assertNotOwnDevice(rc, prior, status);
+    await assertCanActOnDeviceUsers(rc, prior.id);
+  }
   const by = actorId(rc);
   const stmts = [];
   if (status === 'approved') {
@@ -425,7 +467,9 @@ export async function revokeDevice(rc, deviceId) {
   const db = env.DB;
   const t = nowOf(rc);
   const prior = await loadDevice(env, deviceId);
-  if (deviceState(prior) === 'approved') assertNotOwnDevice(rc, prior.id, 'pending');
+  if (deviceState(prior) === 'approved') await assertNotOwnDevice(rc, prior, 'pending');
+  // Every revoke ends the sessions on the device, approved or not.
+  await assertCanActOnDeviceUsers(rc, prior.id);
   await db.batch([
     db
       .prepare(

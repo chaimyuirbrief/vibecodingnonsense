@@ -223,6 +223,53 @@ test('monotone: a later sign-in never gets an earlier deadline — every 30 minu
   }
 });
 
+// STREAK-6: the sweep above never meets a PROTECTED day that is also a clock
+// change — no Saturday or Yom Tov is a DST day in New York, and Kolkata has
+// none. Where one is, a sign-in just before the block got 24 hours per
+// protected day while one just inside it got the block's real length, so the
+// later sign-in lost up to an hour. Each leeway day now counts its real length.
+test('monotone across protected days that are also clock changes — every 15 minutes around each change, 2024–2030', () => {
+  const pairs = [
+    // [config, a sign-in one minute before midnight, the one at midnight]
+    [s.streakConfig({ timezone: 'Australia/Sydney' }), at(2026, 10, 2, 23, 59, 'Australia/Sydney'), at(2026, 10, 3, 0, 0, 'Australia/Sydney')],
+    [s.streakConfig({ streak_weekly_days: [0], streak_hebrew_holidays: '0' }), at(2026, 3, 7, 23, 59), at(2026, 3, 8, 0, 0)],
+  ];
+  for (const [cfg, a, b] of pairs) {
+    const da = s.computeDeadline(a, cfg).deadline;
+    const db = s.computeDeadline(b, cfg).deadline;
+    assert.ok(db >= da, `${cfg.tz}: ${iso(b)} → ${iso(db)} is earlier than ${iso(a)} → ${iso(da)}`);
+    assert.equal(db - da, MIN, 'one minute later, one minute later');
+  }
+  const cfgs = [
+    s.streakConfig({ timezone: 'Australia/Sydney' }),
+    s.streakConfig({ timezone: 'Australia/Lord_Howe' }),
+    s.streakConfig({ streak_weekly_days: [0], streak_hebrew_holidays: '0' }),
+    s.streakConfig({ timezone: 'Europe/London', streak_weekly_days: [0], streak_hebrew_holidays: '0' }),
+    s.streakConfig({ timezone: 'Asia/Jerusalem', streak_weekly_days: [5], streak_hebrew_holidays: '0' }),
+    s.streakConfig({ timezone: 'Asia/Jerusalem', streak_region: 'israel' }),
+  ];
+  for (const cfg of cfgs) {
+    // The days whose noon offset differs from the previous noon's: clock changes.
+    const changes = [];
+    let prevOffset = null;
+    for (let t = Date.UTC(2024, 0, 1, 12); t < Date.UTC(2031, 0, 1); t += D) {
+      const [y, m, d, hh, mm] = wallParts(t, cfg.tz).split(/[- :]/).map(Number);
+      const off = Date.UTC(y, m - 1, d, hh, mm) - t;
+      if (prevOffset !== null && off !== prevOffset) changes.push(t);
+      prevOffset = off;
+    }
+    assert.ok(changes.length >= 12, `${cfg.tz}: found ${changes.length} clock changes`);
+    for (const c of changes) {
+      let prev = s.computeDeadline(c - 5 * D, cfg).deadline;
+      for (let t = c - 5 * D + 15 * MIN; t < c + 4 * D; t += 15 * MIN) {
+        const d = s.computeDeadline(t, cfg).deadline;
+        assert.ok(d >= prev, `${cfg.tz}: ${iso(t)} → ${iso(d)} is earlier than ${iso(prev)}`);
+        prev = d;
+      }
+    }
+  }
+});
+
 test('re-entry grace: 11 pm Thursday → noon Sunday, not 5 am; Friday 11 pm already reaches Monday 5 am', () => {
   const thu = at(2026, 1, 8, 23);
   const r = s.computeDeadline(thu, CFG);
@@ -405,6 +452,21 @@ test('same local day: counts once, and last_at only ever moves forward', async (
   assert.equal(rowOf(env, uid).last_at, iso(at(2026, 1, 6, 23, 59)));
   const next = await s.touchStreak(env, uid, at(2026, 1, 8, 5, 59), CFG);
   assert.equal(next.current, 2, 'Tue 11:59 pm + 30 h = Thu 5:59 am');
+});
+
+test('touchStreak hands its failure to onError (the caller audits it) and still resolves null', async () => {
+  const env = await newEnv();
+  const uid = await addUser(env, { email: 'a@acme.com' });
+  env.DB.sqlite.exec('DROP TABLE streaks');
+  const seen = [];
+  const st = await s.touchStreak(env, uid, at(2026, 1, 6, 10), CFG, { onError: (e) => seen.push(e) });
+  assert.equal(st, null);
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].message, /no such table: streaks/);
+  // A reporter that throws, or none at all, still never throws.
+  assert.equal(await s.touchStreak(env, uid, at(2026, 1, 6, 10), CFG, { onError: () => { throw new Error('boom'); } }), null);
+  assert.equal(await s.touchStreak(env, uid, at(2026, 1, 6, 10), CFG), null);
+  for (const v of HOSTILE) assert.equal(await s.touchStreak(env, uid, at(2026, 1, 6, 10), CFG, v), null, label(v));
 });
 
 test('a later day inside the window counts; at the deadline still counts; one ms past restarts with longest kept', async () => {

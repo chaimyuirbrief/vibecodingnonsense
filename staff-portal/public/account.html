@@ -86,7 +86,7 @@
             <p class="card-sub">How colleagues see you. An administrator manages the rest.</p>
           </div>
         </div>
-        <form id="profile-form" novalidate>
+        <form id="profile-form" method="post" novalidate>
           <div class="field">
             <label for="profile-name">Full name</label>
             <input id="profile-name" name="full_name" type="text" autocomplete="name" maxlength="100" required>
@@ -108,7 +108,7 @@
             <p class="card-sub">At least 12 characters. Changing it signs you out everywhere else.</p>
           </div>
         </div>
-        <form id="password-form" novalidate>
+        <form id="password-form" method="post" novalidate>
           <input id="pw-username" name="username" type="text" autocomplete="username" class="sr-only" tabindex="-1" aria-hidden="true" aria-label="Username" readonly>
           <div class="field">
             <label for="pw-current">Current password</label>
@@ -145,7 +145,7 @@
           <h3 class="sub-title">Passkeys</h3>
           <p class="hint">The strongest option: your fingerprint, face, screen lock or a security key. A passkey can’t be phished.</p>
           <ul id="passkey-list" class="item-list"></ul>
-          <form id="passkey-form" class="toolbar" novalidate>
+          <form id="passkey-form" method="post" class="toolbar" novalidate>
             <div class="field">
               <label for="passkey-label">Name for a new passkey</label>
               <input id="passkey-label" name="label" type="text" maxlength="60" autocomplete="off" spellcheck="false">
@@ -184,7 +184,7 @@
                 <button id="totp-copy" class="btn btn-secondary btn-sm" type="button">Copy key</button>
               </div>
               <a id="totp-link" class="btn btn-link" href="#totp-setup" hidden>Open in an authenticator app on this device</a>
-              <form id="totp-form" novalidate>
+              <form id="totp-form" method="post" novalidate>
                 <div class="field">
                   <label for="totp-code">6-digit code from the app</label>
                   <input id="totp-code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="9" placeholder="123456" required>
@@ -255,7 +255,7 @@
         <div class="sub-section">
           <h3 class="sub-title">Approve another device</h3>
           <p id="approve-note" class="hint">On the new device, open the portal: it shows a code like K7F3-9QX2. Type it here to approve that device for your account. This works only from a device that is itself approved, and asks you to confirm it’s you first.</p>
-          <form id="approve-form" class="toolbar" novalidate>
+          <form id="approve-form" method="post" class="toolbar" novalidate>
             <div class="field">
               <label for="approve-code">Code shown on the new device</label>
               <input id="approve-code" name="code" class="code-input" type="text" autocapitalize="characters" autocomplete="off" spellcheck="false" maxlength="16" placeholder="K7F3-9QX2">
@@ -293,5 +293,6 @@
     </div>
   </div>
 </main>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

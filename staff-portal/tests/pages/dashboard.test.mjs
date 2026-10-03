@@ -278,6 +278,40 @@ test('history strip: today not yet counted is "not counted yet", not missed; pro
   p2.dispose();
 });
 
+test('history strip: days before the person joined are "before you joined" — not missed, not protected, not open days (STREAK-5)', async () => {
+  // Joined Thu Sep 24 at 10:30 PM New York time (Fri 02:30 UTC): the portal's zone decides the day.
+  const me = { ...ME, user: { ...ME.user, created_at: '2026-09-25T02:30:00.000Z' } };
+  const history = makeHistory().map((e) => (e.day < '2026-09-24' ? { ...e, counted: false } : e));
+  const page = await open({ me, streakBody: streak(STATUS.active, { history }) });
+  const cells = page.document.querySelectorAll('#strip .strip-day');
+  const before = cells.filter((c) => c.classList.contains('is-before'));
+  assert.deepEqual(before.map((c) => c.dataset.day), cells.map((c) => c.dataset.day).filter((d) => d < '2026-09-24'));
+  assert.equal(before[0].getAttribute('aria-label'), 'Sun Jul 12: before you joined');
+  for (const c of before) {
+    assert.deepEqual([...c.classList], ['strip-day', 'is-before'], c.dataset.day);
+    assert.equal(c.querySelector('svg'), null, `${c.dataset.day}: no protected glyph`);
+  }
+  assert.ok(page.document.querySelector('#strip [data-day="2026-09-24"]').classList.contains('is-counted'), 'the day they joined is theirs');
+  assert.ok(page.document.querySelector('#strip [data-day="2026-09-30"]').classList.contains('is-missed'), 'a day skipped since is still missed');
+  assert.ok(page.visible('legend-before'));
+  assert.equal(page.text('strip-summary'), 'Signed in on 7 of the last 8 open days. 1 protected day didn’t count against you.');
+  page.dispose();
+
+  const plain = await open();
+  assert.ok(!plain.visible('legend-before'), 'no join date, no "before" squares');
+  assert.equal(plain.document.querySelectorAll('#strip .is-before').length, 0);
+  const m = plain.module;
+  assert.equal(m.localDayOf('2026-09-25T02:30:00.000Z', 'America/New_York'), '2026-09-24');
+  assert.equal(m.localDayOf('2026-09-25T02:30:00.000Z', 'UTC'), '2026-09-25');
+  for (const [v, tz] of [[null, 'UTC'], ['nope', 'UTC'], ['2026-09-25T02:30:00.000Z', ''], ['2026-09-25T02:30:00.000Z', 'Not/AZone'], [7, 'UTC']]) assert.equal(m.localDayOf(v, tz), null, `${v} ${tz}`);
+  // A counted day is evidence and stays counted, whatever the join date says.
+  assert.ok(m.buildStrip(makeHistory(), { since: TODAY }).cells.filter((c) => c.counted).length > 60);
+  const fresh = makeHistory().map((e) => ({ ...e, counted: false }));
+  assert.equal(m.stripSummary(m.buildStrip(fresh, { since: TODAY })), 'No open days to count yet.', 'joined today, nothing yet');
+  for (const junk of [null, 'nope', 7, {}]) assert.equal(m.buildStrip(makeHistory(), { since: junk }).cells.filter((c) => c.before).length, 0);
+  plain.dispose();
+});
+
 test('history strip: junk history does not break the page', async () => {
   const page = await open({ streakBody: streak(STATUS.active, { history: [null, 7, { day: 'nope' }, { day: '2026-02-30' }] }) });
   assert.equal(page.document.querySelectorAll('#strip .strip-day').length, 0);

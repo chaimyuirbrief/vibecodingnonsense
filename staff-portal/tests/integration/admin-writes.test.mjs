@@ -290,6 +290,42 @@ test('sessions and streaks tabs: end someone’s session; adjust a streak in the
   page.dispose();
 });
 
+test('streaks: a lapsed run shows what it was, and Adjust starts from it — in the table and on the person card (STREAK-3)', async () => {
+  const { env, emp, page } = await setup();
+  // An outage: Eve's 12-day run (longest 30) last counted Fri Jan 2; it is now Tue Jan 6.
+  q(env, "UPDATE streaks SET current = 12, longest = 30, total_days = 40, started_day = '2025-12-22', last_day = '2026-01-02', last_at = '2026-01-02T15:00:00.000Z' WHERE user_id = ?", emp.user.id);
+  await page.click('tab-streaks');
+  await settle(page);
+  const api = calls(page, 'GET', '/api/admin/streaks').at(-1).response.streaks.find((x) => x.user_id === emp.user.id);
+  assert.deepEqual([api.state, api.current, api.stored_current, api.longest], ['lapsed', 0, 12, 30]);
+  const row = page.document.querySelector(`#streaks-table tr[data-user-id="${emp.user.id}"]`);
+  assert.equal(row.querySelector('td[data-label="Current"]').textContent, '0 (was 12)', 'the run to restore is on the row');
+  await page.click(byText(row, 'button', 'Adjust'));
+  await settle(page);
+  assert.equal(page.$('adjust-current').value, '12', 'Adjust starts from the run that lapsed, not from 0');
+  assert.equal(page.$('adjust-longest').value, '30');
+  assert.match(openDialog(page).textContent, /It was 12 days when it lapsed\./);
+  await page.click(byText(openDialog(page), 'button', 'Cancel'));
+  await settle(page);
+
+  await openPerson(page, emp.user.id);
+  const before = card(page, 'Streak');
+  assert.match(before.textContent, /Current0 daysBefore it lapsed12 daysLongest30 days/);
+  assert.equal(page.$('streak-current').value, '12');
+  page.fill('streak-reason', 'Portal outage Jan 3–5');
+  await page.submit(before.querySelector('form'));
+  await settle(page);
+  const adj = calls(page, 'POST', `/api/admin/users/${emp.user.id}/streak`)[0];
+  assert.equal(adj.status, 200, JSON.stringify(adj.response));
+  assert.deepEqual(adj.body, { current: 12, longest: 30, reason: 'Portal outage Jan 3–5' });
+  const after = card(page, 'Streak');
+  assert.match(after.textContent, /Current12 days/);
+  assert.ok(!after.textContent.includes('Before it lapsed'), 'restored: nothing lapsed any more');
+  assert.equal(q(env, 'SELECT current FROM streaks WHERE user_id = ?', emp.user.id)[0].current, 12);
+  noFailures(page);
+  page.dispose();
+});
+
 test('blocklist and access mode: block a range, unblock it; switch to invite_only (the caller’s device is kept in)', async () => {
   const { env, page } = await setup();
   await page.click('tab-network');

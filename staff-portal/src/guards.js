@@ -11,7 +11,9 @@
 // gate would let that caller in whatever those settings say.
 
 import { GuardError, ValidationError } from './errors.js';
-import { now, toInt, parseIsoStrict } from './util.js';
+import { now, iso, toInt, parseIsoStrict, DAY } from './util.js';
+import { effectivePermissions, assertCanActOn } from './rbac.js';
+import { actorAuthz } from './users.js';
 import { SETTINGS, resolvePolicy } from './policy.js';
 import { normalizeIp, cidrContains } from './ip.js';
 import {
@@ -102,11 +104,48 @@ export async function assertCanEditAllowed(rc, row, patch) {
   await assertKeepsCover(rc, row, 'Letting it expire');
 }
 
+// How long an address someone signed in from counts as theirs for the
+// block guard below.
+const SEEN_RECENTLY_MS = 30 * DAY;
+
 // POST …/block and the reverter of 'network.block.remove'.
-export function assertCanBlock(rc, cidr) {
+//
+// A block refuses everyone inside it at the gate's first step, sessions and
+// approved devices notwithstanding — so it is an action on each of them, not
+// only on the caller. Like ending their sessions, it needs every active
+// account seen inside the range lately (a live session, or a device it signed
+// in on) to rank below the caller; Super Admins are peers (SPEC §5.5, §12:
+// "a way to lock yourself — or the owner — out").
+export async function assertCanBlock(rc, cidr) {
   const ip = callerIp(rc);
   if (cidrContains(cidr, ip)) {
     throw lockout(`${cidr} contains your own address (${ip}). Blocking it would refuse you at once.`);
+  }
+  const env = rc.env;
+  const t = nowOf(rc);
+  const since = iso(t - SEEN_RECENTLY_MS);
+  const { results } = await env.DB.prepare(
+    `SELECT u.id, u.role_id, u.perm_grants, u.perm_denies, u.status, s.ip AS seen_ip
+       FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.revoked_at IS NULL AND s.idle_expires_at > ? AND u.status = 'active'
+     UNION
+     SELECT u.id, u.role_id, u.perm_grants, u.perm_denies, u.status, d.last_ip AS seen_ip
+       FROM device_users du JOIN users u ON u.id = du.user_id JOIN devices d ON d.id = du.device_id
+      WHERE du.last_seen >= ? AND u.status = 'active'`,
+  )
+    .bind(iso(t), since)
+    .all();
+  const inside = new Map();
+  for (const r of results || []) if (typeof r.seen_ip === 'string' && cidrContains(cidr, r.seen_ip)) inside.set(r.id, r);
+  if (!inside.size) return;
+  const actor = await actorAuthz(rc);
+  for (const u of inside.values()) {
+    try {
+      assertCanActOn(actor, await effectivePermissions(env, u, t), { allowSelf: true });
+    } catch (e) {
+      if (!(e instanceof GuardError)) throw e;
+      throw new GuardError('rank', `Someone ranked at or above you signs in from inside ${cidr}, so only they or someone above them can block it.`);
+    }
   }
 }
 

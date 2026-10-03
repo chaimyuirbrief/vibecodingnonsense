@@ -56,7 +56,7 @@
  *            .streak-state (+ .state-active/at_risk/paused/lapsed/held/none)
  *            .streak-deadline .streak-meta .flame (.is-out) .flame-stop-1..3
  *            .flame-core .strip (12-week grid) .strip-day + .is-counted
- *            .is-protected .is-missed .is-today .is-future .strip-legend
+ *            .is-protected .is-missed .is-today .is-future .is-before .strip-legend
  *            .legend-swatch .upcoming .upcoming-day .rest-chip .leaderboard
  *            .rank .rules
  */
@@ -2348,6 +2348,13 @@ progress {
   border: 1px dashed var(--border);
 }
 
+/* Days before the account existed: nothing to count, nothing missed. */
+.strip-day.is-before {
+  background: transparent;
+  border: 1px solid var(--border);
+  opacity: 0.6;
+}
+
 .strip-day.is-today {
   outline: 2px solid var(--text);
   outline-offset: 1px;
@@ -2963,6 +2970,12 @@ dl.streak-meta {
 .legend-swatch.is-future {
   background: transparent;
   border: 1px dashed var(--border-strong);
+}
+
+.legend-swatch.is-before {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  opacity: 0.6;
 }
 
 .legend-swatch.lvl-1 {

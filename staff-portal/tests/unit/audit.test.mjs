@@ -189,19 +189,27 @@ test('30 concurrent audit() calls → 30 rows, seq 1..30 contiguous, chain verif
   assert.equal((await verifyChain(env)).ok, true);
 });
 
-test('writers in different requests race on the conditional insert and all land', async () => {
+// AUTHZ-3: writes from different requests used to race each other inside one
+// isolate, and a burst of strangers' rows made an administrator's row give
+// up — the change committed with no row. They now share the database's queue.
+test('writers in different requests share one queue: 150 at once all land, no lost races', async () => {
   const env = await makeEnvWithSchema();
-  // Distinct ctx objects = distinct requests: no shared queue, real contention.
-  // Deterministic, not lucky: an attempt only fails because another writer
-  // succeeded, so with 8 writers nobody can lose more than 7 times.
-  const calls = Array.from({ length: 8 }, (_, i) => audit(rcFor(env, { ctx: { waitUntil() {} } }), { action: 'user.edit', detail: `r${i}` }));
+  let inserts = 0;
+  const orig = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    if (/^INSERT INTO audit_log/.test(sql)) inserts++;
+    return orig(sql);
+  };
+  // Distinct ctx objects = distinct requests.
+  const calls = Array.from({ length: 150 }, (_, i) => audit(rcFor(env, { ctx: { waitUntil() {} } }), { action: 'login.fail', outcome: 'failure', detail: `r${i}` }));
   const results = await Promise.all(calls);
-  assert.ok(results.every((r) => r !== null), JSON.stringify(results));
-  assert.deepEqual(rows(env).map((r) => r.seq), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.ok(results.every((r) => r !== null), 'no row was dropped');
+  assert.equal(inserts, 150, 'no attempt was wasted on a race');
+  assert.deepEqual(rows(env).map((r) => r.seq), Array.from({ length: 150 }, (_, i) => i + 1));
   assert.equal((await verifyChain(env)).ok, true);
 });
 
-test('a lost race re-reads the head; after 8 lost attempts it gives up, logs, and returns null', async () => {
+test('a lost race re-reads the head; after 50 lost attempts it gives up, logs, and returns null', async () => {
   const env = await makeEnvWithSchema();
   await fill(env, 3);
   const orig = env.DB.prepare.bind(env.DB);
@@ -217,6 +225,7 @@ test('a lost race re-reads the head; after 8 lost attempts it gives up, logs, an
           run: async () => {
             inserts++;
             if (mode === 'always-lose') return { success: true, meta: { changes: 0 } };
+            if (mode === 'lose-20' && inserts <= 20) return { success: true, meta: { changes: 0 } };
             if (mode === 'unique-once' && inserts === 1) throw new Error('UNIQUE constraint failed: audit_log.seq');
             return bound.run();
           },
@@ -226,14 +235,22 @@ test('a lost race re-reads the head; after 8 lost attempts it gives up, logs, an
   };
   const { value, logged } = await quietly(() => audit(rcFor(env), { action: 'user.edit' }));
   assert.equal(value, null);
-  assert.equal(inserts, 8, 'exactly 8 attempts');
+  assert.equal(inserts, 50, 'exactly 50 attempts');
   assert.ok(logged.some((l) => /gave up/.test(l)));
   assert.equal(rows(env).length, 3, 'no row written');
+
+  // Another isolate winning twenty times in a row is not a reason to lose
+  // the row (the old budget was eight attempts, about a quarter second).
+  inserts = 0;
+  mode = 'lose-20';
+  const late = await audit(rcFor(env), { action: 'user.status' });
+  assert.deepEqual(late, { id: 4, seq: 4 });
+  assert.equal(inserts, 21);
 
   inserts = 0;
   mode = 'unique-once';
   const r = await audit(rcFor(env), { action: 'user.edit' });
-  assert.deepEqual(r, { id: 4, seq: 4 });
+  assert.deepEqual(r, { id: 5, seq: 5 });
   assert.equal(inserts, 2, 'a UNIQUE(seq) error is a lost race: retried');
   assert.equal((await verifyChain(env)).ok, true);
 });

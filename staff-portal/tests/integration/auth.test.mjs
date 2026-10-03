@@ -7,7 +7,7 @@ import { test, assert, run } from '../helpers/t.js';
 import { byText, loadPage } from '../helpers/dom.js';
 import { openLive, browserCredentials, apiErrors, lastNav, settle } from '../helpers/live.js';
 import { SoftAuthenticator } from '../helpers/authenticator.js';
-import { freshEnv, bootstrap, makeUser, client, nextTotp, totpNow, signOut, q, count, OWNER_IP, OWNER, PASSWORD, worker, Client } from '../helpers/flows.js';
+import { freshEnv, bootstrap, makeUser, client, nextTotp, totpNow, signOut, setSetting, q, count, OWNER_IP, OWNER, PASSWORD, worker, Client } from '../helpers/flows.js';
 
 const ORIGIN = 'https://staff.example.com';
 
@@ -224,6 +224,65 @@ test('login: already signed in → the server sends /login home; the page itself
   assert.equal(page.requests('/api/auth/whoami')[0].response.authenticated, true);
   assert.deepEqual(lastNav(page), { type: 'replace', url: '/account' });
   page.dispose();
+});
+
+test('login: a pinned sign-in keeps ?next through enrolment — /admin → /login?next=/admin → enrol → /admin (FE-5)', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  const u = await makeUser(env, owner.client, { role: 'admin' });
+  setSetting(env, 'mfa_policy', 'required');
+  await signOut(u.client);
+
+  const login = await openLive(u.client, '/admin');
+  assert.equal(login.served.file, 'login.html');
+  assert.deepEqual(login.served.redirects, ['/login?next=/admin']);
+  await settle(login);
+  await typePassword(login, u.user.email, PASSWORD);
+  const resp = calls(login, 'POST', '/api/auth/login')[0].response;
+  assert.equal(resp.pinned, 'mfa_enroll');
+  assert.equal(resp.next, '/account?pin=mfa_enroll');
+  assert.deepEqual(lastNav(login), { type: 'replace', url: '/account?pin=mfa_enroll&next=%2Fadmin' }, 'the destination rides along');
+  noErrors(login);
+  login.dispose();
+
+  const acct = await openLive(u.client, lastNav(login).url);
+  assert.equal(acct.served.file, 'account.html');
+  await settle(acct);
+  await click(acct, 'totp-start');
+  const begin = calls(acct, 'POST', '/api/me/mfa/totp/begin')[0];
+  acct.fill('totp-code', await totpNow(new URL(begin.response.otpauth).searchParams.get('secret'), env));
+  await submit(acct, 'totp-form');
+  await click(acct, 'codes-done');
+  assert.deepEqual(lastNav(acct), { type: 'replace', url: '/admin' }, 'on to where they were going, not home');
+  noErrors(acct);
+  acct.dispose();
+  const admin = await openLive(u.client, '/admin');
+  assert.equal(admin.served.file, 'admin.html');
+  admin.dispose();
+});
+
+test('a credential form submitted before its script binds POSTs to its own page: no page, no cookie, and the secret is stored nowhere (FE-2)', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  const secret = 'Correct-Horse-9!';
+  const native = { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document', 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html' };
+  const body = `identifier=jane%40acme.com&password=${encodeURIComponent(secret)}`;
+  const tries = [
+    [client(env), '/login?next=/admin'], // a stranger: the gate decides
+    [owner.client, '/account'], // signed in: no page answers a POST
+  ];
+  for (const [c, path] of tries) {
+    const r = await c.request('POST', path, body, native);
+    assert.ok(r.status === 403 || r.status === 404, `${path}: ${r.status}`);
+    assert.equal(r.text, '', `${path}: a page came back`);
+    assert.equal(r.headers.get('set-cookie'), null, path);
+  }
+  setSetting(env, 'access_mode', 'fingerprint_gate'); // the login shell
+  const shell = await client(env).request('POST', '/', body, native);
+  assert.equal(shell.text, '', 'the login shell serves no page to a POST');
+  for (const { name } of q(env, "SELECT name FROM sqlite_master WHERE type = 'table'")) {
+    assert.ok(!JSON.stringify(q(env, `SELECT * FROM "${name}"`)).includes(secret), `the password landed in ${name}`);
+  }
 });
 
 // ------------------------------------------------------------ setup ----

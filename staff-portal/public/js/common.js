@@ -839,6 +839,9 @@ export function setFieldError(input, message) {
 const TOAST_KINDS = { info: 'info', ok: 'ok', success: 'ok', warn: 'warn', warning: 'warn', danger: 'danger', error: 'danger' };
 const TOAST_ICONS = { info: 'info', ok: 'check', warn: 'alert', danger: 'alert' };
 
+// Every page ships an empty #toasts live region: a region created together
+// with its first message is often not announced at all. A failure is an
+// alert of its own, not something to read out when convenient.
 export function toast(message, kind = 'info', { timeout = 5000 } = {}) {
   const k = TOAST_KINDS[kind] || 'info';
   let region = document.getElementById('toasts');
@@ -847,7 +850,7 @@ export function toast(message, kind = 'info', { timeout = 5000 } = {}) {
     document.body.appendChild(region);
   }
   const close = h('button', { type: 'button', class: 'toast-close', 'aria-label': 'Dismiss' }, icon('x', { size: 16 }));
-  const t = h('div', { class: `toast toast-${k}` }, icon(TOAST_ICONS[k], { size: 18 }), h('span', { class: 'toast-msg' }, message), close);
+  const t = h('div', { class: `toast toast-${k}`, role: k === 'danger' ? 'alert' : null }, icon(TOAST_ICONS[k], { size: 18 }), h('span', { class: 'toast-msg' }, message), close);
   close.addEventListener('click', () => t.remove());
   region.appendChild(t);
   if (timeout > 0) setTimeout(() => t.remove(), timeout);

@@ -54,6 +54,39 @@ test('unknown, wrong, suspended, disabled, invited and locked all get the same 4
   void bob;
 });
 
+// SPEC §16.25–16.26: the password is checked BEFORE the account's state. A
+// suspended or disabled account with a WRONG password is a wrong password —
+// in the log too — and costs the same derivation as any other account, so
+// neither the reply, the clock nor the log says "this one is suspended".
+test('suspended and disabled accounts with a wrong password: a wrong password, at full cost', async () => {
+  const { env, owner } = await world();
+  const real = crypto.subtle.deriveBits.bind(crypto.subtle);
+  async function attempt(identifier) {
+    let derivations = 0;
+    crypto.subtle.deriveBits = (...a) => {
+      derivations++;
+      return real(...a);
+    };
+    try {
+      assertInvalid(await client(env, { ip: OWNER_IP }).post('/api/auth/login', { identifier, password: 'definitely-wrong-000' }), identifier);
+    } finally {
+      crypto.subtle.deriveBits = real;
+    }
+    return { derivations, detail: auditRows(env, 'login.fail').at(-1).detail };
+  }
+  await makeUser(env, owner.client, { email: 'active@acme.com' });
+  const baseline = await attempt('active@acme.com');
+  assert.ok(baseline.derivations >= 1);
+  for (const [status, email] of [['suspended', 'sam@acme.com'], ['disabled', 'dina@acme.com']]) {
+    const u = await makeUser(env, owner.client, { email });
+    q(env, 'UPDATE users SET status = ? WHERE id = ?', status, u.user.id);
+    const r = await attempt(email);
+    assert.match(r.detail, /^Wrong password for/, `${status}: ${r.detail}`);
+    assert.doesNotMatch(r.detail, /correct password|suspended|disabled/);
+    assert.equal(r.derivations, baseline.derivations, `${status}: the same password work as an active account`);
+  }
+});
+
 test('hostile identifiers and passwords get the same 401 and no session', async () => {
   const { env } = await world();
   const c = client(env, { ip: OWNER_IP });
@@ -93,6 +126,26 @@ test('an allowlisted address gets the higher per-IP ceiling', async () => {
   }
 });
 
+// SPEC §6.4: login_ip is the only brake on spraying one guess across many
+// accounts. Keyed per address, one IPv6 /64 — one home line, one server —
+// would be 2^64 buckets and no brake at all.
+test('one IPv6 /64 is one per-address bucket: rotating addresses inside it does not dodge the spray brake', async () => {
+  const { env } = await world();
+  setSetting(env, 'access_mode', 'public');
+  const fails = auditRows(env, 'login.fail').length;
+  const statuses = {};
+  for (let i = 0; i < 50; i++) {
+    const c = client(env, { ip: `2a01:4f8:c17:1a2b:${(i + 1).toString(16)}::1` });
+    const r = await c.post('/api/auth/login', { identifier: `ghost${i}@acme.com`, password: PASSWORD });
+    statuses[r.status] = (statuses[r.status] || 0) + 1;
+  }
+  assert.deepEqual(statuses, { 401: 20, 429: 30 });
+  assert.equal(auditRows(env, 'login.fail').length - fails, 20, 'only the guesses let through reach the log');
+  assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login_ip' AND subject = '2a01:4f8:c17:1a2b::/64'"), 20, 'refused attempts add no rows');
+  // The neighbouring /64 is another line with its own bucket.
+  assertInvalid(await client(env, { ip: '2a01:4f8:c17:1a2c::1' }).post('/api/auth/login', { identifier: 'ghost@acme.com', password: PASSWORD }), 'next /64');
+});
+
 test('the per-identifier bucket refuses the 11th try in 15 minutes, from any address', async () => {
   const { env, owner } = await world();
   await makeUser(env, owner.client, { email: 'bob@acme.com' });
@@ -101,7 +154,58 @@ test('the per-identifier bucket refuses the 11th try in 15 minutes, from any add
   }
   const r = await client(env, { ip: OWNER_IP }).post('/api/auth/login', { identifier: 'bob@acme.com', password: PASSWORD });
   assert.equal(r.status, 429, 'normalised identifiers share a bucket');
-  assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login_id' AND subject = 'bob@acme.com'"), 11);
+  assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'login_id' AND subject = 'bob@acme.com'"), 10, 'the refused 11th is not recorded');
+});
+
+// SPEC §6.4: login_id's subject is the normalised identifier — the name the
+// lookup matches. A username is matched on its first 32 characters, so every
+// longer spelling of a 32-character username is the same account and must be
+// the same bucket.
+test('every spelling the lookup treats as one account is one login_id bucket', async () => {
+  const { env, owner } = await world();
+  const U = 'abcdefghijklmnopqrstuvwxyz012345';
+  assert.equal(U.length, 32);
+  const rc = await actorRc(env, owner.user);
+  await createUser(rc, { email: 'long@acme.com', full_name: 'Long Name', role_id: roleId(env, 'employee'), username: U });
+  const atk = client(env, { ip: OWNER_IP });
+  const statuses = [];
+  for (let i = 0; i < 15; i++) {
+    const r = await atk.post('/api/auth/login', { identifier: ` ${U}${String.fromCharCode(97 + i)}`.toUpperCase(), password: `wrong-password-${i}` });
+    statuses.push(r.status);
+  }
+  assert.deepEqual(statuses, [...Array(10).fill(401), ...Array(5).fill(429)]);
+  assert.deepEqual(q(env, "SELECT DISTINCT subject FROM auth_attempts WHERE kind = 'login_id'").map((r) => r.subject), [U]);
+});
+
+// D6: "a stranger can lock an account against strangers, never against a
+// device that has signed in to it before" — and that holds for the
+// per-identifier bucket too, not only the account lock, for as long as the
+// stranger keeps going.
+test('a stranger spending the login_id bucket cannot keep the owner out of their own laptop', async () => {
+  const { env, owner } = await world();
+  setSetting(env, 'access_mode', 'public');
+  const attacker = client(env, { ip: '185.15.56.77' });
+  const elsewhere = client(env, { ip: '91.198.174.77' }); // the owner's password, on a device the account has never used
+  for (let round = 0; round < 4; round++) {
+    for (let i = 0; i < 11; i++) await attacker.post('/api/auth/login', { identifier: OWNER.email, password: `junk-${round}-${i}-xxxxx` });
+    advance(env, 7 * MINUTE);
+    const r = await owner.client.post('/api/auth/login', { identifier: OWNER.email, password: OWNER.password });
+    assert.equal(r.status, 200, `round ${round}: ${r.text}`);
+    assert.equal((await elsewhere.post('/api/auth/login', { identifier: OWNER.email, password: OWNER.password })).status, 429, `round ${round}: the account's bucket still holds for an unknown device`);
+    advance(env, 8 * MINUTE);
+  }
+  // The laptop's own bucket is still a limit: ten wrong guesses from it, then 429.
+  const fresh = await world();
+  for (let i = 0; i < 10; i++) assertInvalid(await fresh.owner.client.post('/api/auth/login', { identifier: OWNER.email, password: `wrong-${i}-password` }), `own guess ${i}`);
+  assert.equal((await fresh.owner.client.post('/api/auth/login', { identifier: OWNER.email, password: OWNER.password })).status, 429);
+});
+
+test('an office insider cannot keep the owner out of their own laptop either', async () => {
+  const { env, owner } = await world();
+  const insider = client(env, { ip: OWNER_IP });
+  for (let i = 0; i < 11; i++) await insider.post('/api/auth/login', { identifier: OWNER.email, password: `junk-${i}-xxxxxxxx` });
+  const r = await owner.client.post('/api/auth/login', { identifier: OWNER.email, password: OWNER.password });
+  assert.equal(r.status, 200, r.text);
 });
 
 test('ten failures lock the account against strangers, never against a device that signed in to it before', async () => {

@@ -418,7 +418,9 @@ test('showError / setFieldError / toast / busy', async () => {
   assert.equal(region.getAttribute('aria-live'), 'polite');
   assert.match(p.text('toasts'), /Saved\./);
   assert.ok(p.calls.timers.some((x) => x.delay === 5000), 'auto-dismiss timer');
-  c.toast('Second', 'danger');
+  assert.equal(t.getAttribute('role'), null, 'a confirmation waits its turn in the polite region');
+  const bad = c.toast('Second', 'danger');
+  assert.equal(bad.getAttribute('role'), 'alert', 'a failure is announced at once (FE-6)');
   assert.equal(p.document.querySelectorAll('#toasts').length, 1, 'one region');
   await p.fireTimers(5000);
   assert.equal(region.children.length, 0, 'dismissed');

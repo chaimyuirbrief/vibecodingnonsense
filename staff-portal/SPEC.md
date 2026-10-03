@@ -279,6 +279,7 @@ staff-portal/
   worker.js               pipeline: healthz → secrets → gate → session → routes → headers
   src/
     util.js crypto.js     total coercion, bytes, cookies; PBKDF2 chain, tokens, AES-GCM
+    errors.js router.js   HttpError / GuardError / ValidationError; the route table
     schema.js             DDL, append-only migrations, role seeding
     catalog.js rbac.js    permission catalogue and roles; effective permissions and guards
     policy.js             settings registry: defaults and restrictive readings
@@ -290,12 +291,16 @@ staff-portal/
     fingerprint.js gate.js  edge and browser signals, risk; the per-request access decision
     sessions.js users.js invitations.js
     mfa/  webauthn/       TOTP, backup codes, sent codes, factors; CBOR, DER, COSE, passkeys
+    notify.js qr.js       SMS and email providers; the QR encoder (SVG, no external service)
     calendar/ streak.js   Hebrew calendar, protected days; the streak engine
+    context.js pages.js   the request context; page routing, shells, deny responses, headers
     signin.js             completeSignIn — the one tail every sign-in shares
     guards.js             self-lockout guards
-    api/                  public, auth, me, admin, admin-security
+    api/                  index (registers the rest), public, auth, me, admin, admin-security
   public/                 one HTML file per page, /css/app.css, /js/<page>.js
-  tests/                  unit, e2e (drives worker.fetch), pages (DOM stub), helpers
+  scripts/bundle-check.mjs  `npm run check`: bundle the worker and every page script (§15.6)
+  tests/                  unit, e2e (drives worker.fetch), pages (DOM stub),
+                          integration (real pages against the real worker), helpers, run.mjs
   docs/CONTRACTS.md       exact exports, routes, shapes, settings
 ```
 
@@ -315,7 +320,7 @@ Each step fully decides before the next one runs. The order is not arbitrary.
 request
   │
   ├─ /healthz ─────────────────────────────────────────► 200 "ok"  (before everything)
-  ├─ SESSION_SECRET or DATA_KEY missing ───────────────► empty 503
+  ├─ SESSION_SECRET/DATA_KEY missing, short or equal ──► empty 503
   ▼
 STEP 1  HARD BLOCKS
         blocked device · no usable address · blocklisted address ──────► nothing
@@ -803,12 +808,18 @@ and the factor must not be completable with a code already in hand.
 
 Every limited action is **charged before the check it protects**: insert the
 attempt, prune old rows in the same batch, count, then decide. A correct
-password costs the same as a wrong one.
+password costs the same as a wrong one. A bucket that is *already* full refuses
+without inserting: otherwise one stranger hammering a refused route grows the
+attempts table without bound (§16.34).
+
+Every per-address bucket is keyed on the caller's **network**: an IPv4 address,
+or an IPv6 `/64`. A home line or a server is handed a whole /64, and keyed per
+address it would have 2^64 buckets — no brake at all.
 
 | Bucket | Limit | Subject |
 |---|---|---|
 | `login_ip` | 20 per 10 min (200 for an allowlisted address) | client address |
-| `login_id` | 10 per 15 min | normalised identifier |
+| `login_id` | 10 per 15 min | normalised identifier — the name exactly as the lookup matches it; a device that has signed in to the account before has its own bucket |
 | `mfa_user` | 5 per 15 min | user — sign-in **and** step-up factor attempts |
 | `otp_send` | 5 per 15 min | user — codes sent (texts cost money) |
 | `curpw_user` | 10 per 15 min | user — current-password checks |
@@ -833,7 +844,10 @@ after N failures. Both are right, so the merged rule is: **ten consecutive
 failures lock the account for fifteen minutes — except on a device that has
 signed in to that account before.** A stranger hammering an address from
 outside can lock it against strangers; they cannot lock its owner out of their
-own laptop. The device ledger (`device_users`) is what makes the distinction,
+own laptop. The same goes for the per-identifier bucket: a device that has
+signed in to the account before is charged to a bucket of its own, so junk
+sign-ins from elsewhere cannot hold the owner out for as long as they keep
+coming. The device ledger (`device_users`) is what makes the distinction,
 and a device cookie cannot be forged (§8.1). The lock is invisible to the
 caller (§6.3); administrators see `locked: true` on the account, never the raw
 counters.
@@ -1281,7 +1295,16 @@ methods as sign-in — bound to the current session, charged to the same
 the future (a moved clock, a restore) is not fresh forever: one minute of skew
 is allowed and no more. Self-service actions that weaken an account — removing
 an authenticator or passkey, regenerating backup codes, approving a device for
-yourself — need a step-up too.
+yourself — need a step-up too. So does **adding** a factor to an account that
+can already prove itself: otherwise whoever sits at a session whose step-up has
+gone stale registers a passkey of their own, steps up with it, and removes the
+owner's real factors. Only a first factor (or one added while the session is
+pinned to enrolment) is added on the session alone, and only that one marks
+step-up when confirmed. And minting an account into a role that carries a
+danger permission — an invitation, an approved access request, a fresh link
+for someone still invited — needs one too: it is the same outcome as giving
+an existing person that role, which `users.roles` already guards, and without
+it a stale session invites a Super Admin of its own.
 
 ### 7.10 The sign-in page's state machine
 
@@ -1384,6 +1407,15 @@ one returns it to pending. Both drop its grace windows and end the sessions on
 it. People can forget a device of their own from their devices page, which
 does the same for them.
 
+Because blocking or revoking a device signs out — and, wherever approval
+matters, keeps out — everyone who uses it, it is an action on each of them:
+it needs every active account that has signed in on the device to rank below
+the caller (§5.5), exactly as ending their sessions directly does. Approving
+is for waiting devices only; lifting a block is unblocking (`devices.manage`),
+never an approval. The code a waiting device shows is what approves it, so the
+device list shows it only to those who may approve devices — a read-only role
+never learns something that grants a write (§16.19).
+
 ### 8.3 `SameSite=Lax`, not `Strict`
 
 `Strict` withholds the cookie on *any navigation that began somewhere else* — a
@@ -1461,7 +1493,11 @@ pending page, which is where people are when they need it.
 - Expired entries are **kept** — so an administrator can see what lapsed — and
   excluded by every query. "Active" and "live" always mean *not expired*.
 - The **blocklist** takes the same address syntax with a reason and an optional
-  expiry, and blocks at the gate's first step.
+  expiry, and blocks at the gate's first step. **Every live entry is read** —
+  a page at a time, never only the first page: reading the oldest 10,000 once
+  left every newer block shown as active in the console and enforced nowhere.
+  The list stops at 10,000 live blocks, refused with a sentence, because every
+  request reads all of them.
 
 Removing entries is guarded (§12): never the last live entry, and never one
 whose removal would leave the caller's own address uncovered.
@@ -1773,7 +1809,8 @@ repeat at most 8 rounds:
     count  = number of protected days d with  lastDay < d ≤ endDay
     closed = the latest protected d with lastDay < d < endDay whose next day
              is NOT protected — a block that ends inside the window — or none
-    next   = base + min(count, maxLeewayDays)·D
+    next   = base + the real lengths of the first min(count, maxLeewayDays)
+             of those protected days        // 23 or 25 hours across a clock change
     if closed and graceHours > 0:
         next = max(next, firstInstantOf(closed + 1) + graceHours·H)   // §10.7
     next   = min(next, hardCap)                                         // §10.8
@@ -1786,10 +1823,14 @@ Read it term by term:
 - **Days strictly after the sign-in's own day** are counted. A day you signed in
   on needs no excuse — and if that day was itself protected, the window does
   not start until the block ends (below).
-- **Each protected day adds 24 real hours**, up to the leeway cap
-  (`streak_max_leeway_days`, default 4). A day of protection is a day of
-  opportunity given back, which is the same thing B called "adding protected
-  time back to the window": for whole days, the two formulations agree.
+- **Each protected day adds its own real length** — 24 hours, or 23 or 25 on
+  the day the clocks change — up to the leeway cap (`streak_max_leeway_days`,
+  default 4). A day of protection is a day of opportunity given back, which is
+  the same thing B called "adding protected time back to the window": for whole
+  days, the two formulations agree. Counting a fixed 24 hours instead broke
+  that agreement on a protected clock-change day: a sign-in a minute before
+  the block got an hour more than one a minute inside it (Sydney's default
+  calendar, Simchas Torah on 4 October 2026, the morning the clocks go forward).
 - **It terminates.** Each round can only add days, so `next` never decreases;
   it is bounded by the hard cap; and there is a round limit regardless. With the
   default calendar, every sign-in over several years converges within five
@@ -1810,7 +1851,9 @@ instant after that block (midnight, in the day model), and the block's days are
 not counted again as leeway. Saturday 12:10 AM and Saturday 9:00 PM both open
 the window at midnight going into Sunday and run to 6:00 AM Monday. The
 invariant is now unconditional and tested every half hour over two years on
-three calendars: **a later sign-in never yields an earlier deadline.** The hard
+three calendars, and every quarter hour around each clock change from 2024 to
+2030 in zones where a protected day is one: **a later sign-in never yields an
+earlier deadline.** The hard
 cap is measured from the sign-in itself, so the late opening cannot widen it.
 
 ### 10.7 Re-entry grace
@@ -1908,7 +1951,7 @@ The status the dashboard renders has one of six states, decided in this order:
 |---|---|---|
 | `none` | no streak row yet | "No streak yet — it starts with your next sign-in" |
 | `held` | the last sign-in is recorded in the future (§10.15) | the stored count, "on hold" — nothing is judged |
-| `lapsed` | now is past the deadline | 0, longest 12 — "sign in to start again" |
+| `lapsed` | now is past the deadline (or the stored count is 0, or the stored anchor is unreadable) | 0, longest 12 — "sign in to start again" |
 | `paused` | today is protected and has not counted | "Paused for Shabbos — safe until Sun 4:00 PM" |
 | `at_risk` | today has not counted and less than 6 hours remain | "Sign in before 4:00 PM to keep your 12-day streak" |
 | `active` | everything else | "🔥 12 days — sign in before Wed 4:00 PM" |
@@ -2108,8 +2151,14 @@ nowhere else:
   or a backup was restored — **hold**: change nothing. Treating it as expired
   punishes the person for our clock; treating it as valid forever invents a
   streak. Neither; wait for real time to catch up.
-- **Same local day as the last counted day** → only move the anchor forward to
-  the later of the two instants.
+- **Same local day as the last counted day** → move the anchor forward to the
+  later of the two instants. A real sign-in is still always *logged*: if today
+  has no day-log entry yet — an administrator's restore claims today without
+  one (§10.18) — this sign-in writes it and adds one to total days; and if the
+  stored count is 0 (set to 0 today), it restarts at 1 with today as the
+  started day, as "your next sign-in starts a new streak" promised.
+- **The last counted day is after today** (the portal's time zone changed) →
+  only move the anchor forward.
 - **A later day** → if now is at or before the deadline computed from the
   stored anchor, `current + 1`; otherwise restart at 1 with today as the
   started day. Either way update longest, add one to total days, set the last
@@ -2117,21 +2166,25 @@ nowhere else:
   that person's day log older than 400 days in the same batch.
 
 **Concurrency.** Two sign-ins at once — a laptop and a phone — must not count a
-day twice. The update is conditional on the last day it read (`… WHERE user_id
-= ? AND last_day IS ?`); if no row changed, another sign-in won, so re-read
-and treat this one as same-day. The first insert is `ON CONFLICT DO NOTHING`
+day twice. Every update is conditional on what it read (for a later day, the
+last day: `… WHERE user_id = ? AND last_day IS ?`); if no row changed, another
+sign-in won, so re-read and treat this one as same-day. The day-log entry is
+written only if the streak row now carries this very sign-in, so the loser
+leaves no cell it did not count. The first insert is `ON CONFLICT DO NOTHING`
 followed by a re-read. No read-then-write race, no double counting.
 
 ### 10.16 Never let a streak block a sign-in
 
 A streak is decoration on the critical path. All of `touchStreak` is wrapped:
-any failure is logged and the function returns nothing, and the sign-in
-proceeds. **The worst a streak failure may do is fail to count today.** It runs
-after the session has been created, so nothing it does can stop one being
-issued.
+any failure is handed back to the sign-in path, which records the real
+exception in the audit log as `streak.error` at critical severity (§11.3), the
+function returns nothing, and the sign-in proceeds. **The worst a streak
+failure may do is fail to count today.** It runs after the session has been
+created, so nothing it does can stop one being issued.
 
 The test for this **drops the `streaks` table entirely** and asserts that a
-sign-in still succeeds end to end. That is the right shape of test for any
+sign-in still succeeds end to end, that exactly one `streak.error` row is
+written, and that the admin overview and the person's panel still load. That is the right shape of test for any
 non-essential subsystem hanging off a critical path.
 
 ### 10.17 What the dashboard shows
@@ -2144,7 +2197,9 @@ The dashboard leads with the streak:
 - **"Paused for Shabbos"** (or the festival's name) when today is protected;
 - **a twelve-week history strip**: each day counted, protected, missed, today,
   or still to come, so a reset is explained by the picture rather than argued
-  about;
+  about. Days before the person's account existed (the day of `created_at` in
+  the portal zone) are drawn as "before you joined" — never missed, never
+  protected — and are not counted as open days in the strip's summary;
 - **coming up**: the protected days in the next three weeks, with their names,
   so nobody is surprised by a festival;
 - **the rules in one sentence**, generated from the configuration — window,
@@ -2168,9 +2223,18 @@ the evidence for "why did my streak reset?"
 `streaks.manage` (a dangerous permission, so it needs a step-up) can set a
 person's current and longest counts, with a **reason**. The write is audited
 as `streak.adjust` with an undo snapshot of the prior row (undo kind `streak`),
-so a mistaken restore is itself revertible by a Super Admin (§11.4). Use it
+so a mistaken restore is itself revertible by a Super Admin (§11.4) — while
+the row is still what the adjustment left. Once the person has signed in since,
+the revert is refused rather than silently wiping the days they earned (the
+total included, which no control can set back), exactly as an `mfa.reset`
+revert is refused once they have enrolled again; adjust by hand instead. A
+restore also never swallows a real sign-in: it claims today, so the person's
+own first sign-in that day still writes the day log. Use it
 after a portal outage, a clock problem, a closure longer than the leeway cap,
-or a calendar bug found after the fact.
+or a calendar bug found after the fact. A lapsed streak reads 0, but the
+console shows the run its row still holds ("0 (was 12)", "Before it lapsed")
+and the adjust form starts from that run, because restoring it is what the
+form is for.
 
 ### 10.19 Testing the streak
 
@@ -2250,7 +2314,11 @@ survive UTF-8 and a NUL is not safe in every driver — because a value that
 comes back from the database a byte different would make an honest row "break"
 the chain. A new row is inserted only if the head has not moved since it was
 read; two writers racing for the same position cannot both win, and the loser
-retries.
+retries. Within one isolate every write to the database queues behind the
+last — whichever request it came from — so a flood of strangers' rows cannot
+make an administrator's row lose race after race and give up while the change
+it records goes ahead; across isolates the retry budget is generous (about
+two seconds of jittered backoff), because giving up means an action with no row.
 
 **Verify** recomputes the chain from the first row, in pages, and reports
 either *intact across N rows* or the first row where it stops matching. That
@@ -2388,7 +2456,8 @@ says what to do instead:
 |---|---|
 | remove an allowlist entry | it is the last live entry — an empty allowlist locks out everyone |
 | remove, edit or expire an allowlist entry | afterwards, no live entry would cover the caller's own address — "add your new address first" |
-| add a block | the range contains the caller's address |
+| add a block | the range contains the caller's address (and, refused with `403 rank` instead: anyone active seen inside it lately ranks at or above the caller — a block is an action on everyone behind it) |
+| block, revoke or un-approve a device | it is the device the caller is using and the gate needs its approval to let them in — device gating, lockdown, `invite_only`, or the allowlist mode off the allowlist; the gate itself is asked, with the device as it would be |
 | `country_allow` / `country_deny` | it would refuse the caller's country — unless the caller's address is allowlisted |
 | `block_tor`, `block_datacenter`, `block_automation` | the caller currently trips it — unless allowlisted |
 | `risk_threshold` | it is at or below the caller's current score — unless allowlisted |
@@ -2505,8 +2574,9 @@ Three secrets, each at least 32 characters (generate 48 random bytes):
   authenticator secrets. **Never the same value as `SESSION_SECRET`.**
 - **`SETUP_KEY`** guards the one-time bootstrap.
 
-If `SESSION_SECRET` or `DATA_KEY` is missing or short, every request except
-`/healthz` gets an empty 503 and the reason goes to the log. Secrets live in
+If `SESSION_SECRET` or `DATA_KEY` is missing or short, or the two are the
+same value, every request except `/healthz` gets an empty 503 and the reason
+goes to the log. Secrets live in
 the platform's secret store (`wrangler secret put`) and, for local
 development, in `.dev.vars`, which is ignored by git — never in
 `wrangler.jsonc` and never in the repository.
@@ -2541,6 +2611,7 @@ construction.
 | `sessions` | creating a session | absolute-expired or revoked more than 7 days ago |
 | `devices` (pending only) | minting a device | pending and unseen for 30 days; at most 2,000 pending |
 | `streak_days` | recording a sign-in | that person's days older than 400 (the strip shows 84; a year of evidence for restores) |
+| `access_requests` | recording a request | made (still pending) or decided over 90 days ago; newest 2,000 kept |
 | `audit_log` | **never** | paged in the console; the chain verifies from the first row |
 | `allowed_ips` | **never** | expired rows are kept for the record and excluded by queries |
 
@@ -2560,7 +2631,8 @@ portal, the means to tell them apart:
 1. **`/healthz`** answers `ok` before the gate does anything. If it answers and
    everything else is empty, the gate is working and you are not trusted from
    here. If nothing answers, it is an outage.
-2. **An empty 503** means a secret is missing (§13.3).
+2. **An empty 503** means a secret is missing, too short, or `DATA_KEY` equals
+   `SESSION_SECRET` (§13.3); the log says which.
 3. **The visit log** records every refusal with the address, country, network
    and a machine reason (`not_allowlisted`, `country`, `tor`, `risk`, …). It
    is the first thing to look at for "was it me?" — from somewhere the portal
@@ -2699,6 +2771,17 @@ production, where the edge overwrites the header. **A passing local run is
 evidence, not proof.** Run the dry-run deploy on every change, and test in
 production-like conditions before trusting a new crypto path.
 
+One ceiling runs the other way: **D1 is stricter than `node:sqlite`**, and
+local D1 is the real engine. A statement may bind at most **100 parameters**
+(`too many SQL variables`), and a LIKE or GLOB pattern — literal or bound —
+may be at most **50 bytes** (`LIKE or GLOB pattern too complex`). Queries
+that passed every node test failed under `wrangler dev`: `LIKE '%…%'` searches
+over people and the audit log, a timestamp-shape GLOB that took the gate (and
+setup) down, and an `IN (…)` list of every device in the inventory. Search with `instr()`, check shapes with short GLOBs,
+and chunk `IN` lists (CONTRACTS §0 item 10). The tests' D1 stand-in now
+enforces both limits (§15.1), but walk the screens you changed under
+`wrangler dev` anyway.
+
 ### 14.7 The first deploy
 
 - Replace the placeholder `database_id` (all zeros) with the one
@@ -2741,7 +2824,10 @@ Node ships `node:sqlite`. A small adapter exposes D1's interface —
 schema and its real SQL**. A mock would have accepted every query this found
 wrong. Normalise parameters the way the real binding does — `undefined` and
 `null` become `NULL`, booleans become 0 and 1, anything unbindable throws — or
-you will chase differences that are the adapter's fault.
+you will chase differences that are the adapter's fault. And enforce the
+limits D1 enforces and SQLite does not (§14.6): more than 100 bound parameters,
+or a LIKE/GLOB pattern over 50 bytes, must fail in the adapter exactly as it
+fails in production (`tests/helpers/d1.js`).
 
 ### 15.2 Drive the real `fetch` handler
 

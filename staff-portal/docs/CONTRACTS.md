@@ -39,16 +39,18 @@ Section references like *A §14.1* or *B trap 4* point into those.
    only when both sides came from `util.iso` (`util.isoShapeSql(col)` checks
    the shape in SQL). Wall-clock from `util.now(env)` only — never
    `Date.now()` in `src/` (tests inject `env.__clock`).
-10. **Production D1 limits** that node:sqlite does not enforce (the test
-    stand-in does): at most **100 bound parameters** per statement, and
-    **LIKE/GLOB patterns of at most 50 bytes**, literal or bound. Search with
-    `instr()`, not `LIKE '%…%'`; chunk `IN (…)` lists. Each of these once
-    turned into a production 500 that every local test passed.
 8. **One function per shared path** (A §14.8): one `completeSignIn`, one
    `canDropFactor`, one `assertNotLastSuper`, one `validatePublicKey`.
 9. **The undo catalogue is one object** (A §9, §14.9): `reverters.js` exports
    `REVERTERS`; `undo.js` refuses to record an undo for a kind not in it; a
    test closes the loop.
+10. **Production D1 limits** that node:sqlite does not enforce (the test
+    stand-in, `tests/helpers/d1.js`, does): at most **100 bound parameters**
+    per statement, and **LIKE/GLOB patterns of at most 50 bytes**, literal or
+    bound. Search with `instr()`, not `LIKE '%…%'`; chunk `IN (…)` lists
+    (`devices.listDevices` uses 90 ids a statement). Each of these once turned
+    into a production 500 that the whole node suite passed; `wrangler dev`
+    found them, because local D1 enforces the real limits.
 
 ---
 
@@ -150,8 +152,9 @@ Every module is an ES module with explicit `.js` import specifiers so plain
 | `__clock` | **tests only** | `() => ms`; vars are strings so production can never set it |
 | `__fetch` | **tests only** | replaces `fetch` for outbound provider calls |
 
-Missing `SESSION_SECRET` or `DATA_KEY` → every request except `/healthz`
-answers an empty 503 (fail closed) and logs why.
+Missing or short (< 32 characters) `SESSION_SECRET` or `DATA_KEY`, or the two
+equal → every request except `/healthz` answers an empty 503 (fail closed) and
+logs why.
 
 ---
 
@@ -209,7 +212,10 @@ await auditError(rc, 'user.create', err, { target, detail });   // critical + re
 ```
 
 `audit` and `auditError` resolve to `{ id, seq }` or `null` and **never
-throw**. Scrubbing removes any key matching
+throw**. Appends to one database queue behind each other within an isolate,
+whatever request they come from; a writer that loses the conditional insert
+to another isolate re-reads the head and retries (50 attempts, jittered
+backoff capped at 64 ms) before giving up with `null`. Scrubbing removes any key matching
 `/pass|secret|token|hash|salt|code|cookie|session/i` from `before`/`after`
 (recursively). `undo_payload` is not scrubbed — it is server-only.
 
@@ -252,7 +258,7 @@ import if the two sets differ; a test also scans `src/` for every
 | `role.create` | `{ roleId }` | delete it (refused while anyone holds it) |
 | `role.edit` | `{ roleId, prior: { name, rank, permissions, description } }` | edit back (reserved/minting checks) |
 | `role.delete` | `{ row }` | recreate it with the same key |
-| `streak` | `{ userId, prior }` (streaks row or null) | restore the row (or delete if null) |
+| `streak` | `{ userId, prior, wrote }` (streaks row or null; `wrote` = the columns the adjustment left) | restore the row (or delete if null) — refused (409 `changed_since`) unless the live row still holds exactly `wrote`: a sign-in since would otherwise be wiped. The `audit.revert` row records what it overwrote (before) and left (after) |
 | `destination.add` | `{ userId, id }` | remove it (never the last usable factor) |
 | `destination.remove` | `{ userId, row }` | re-add it |
 
@@ -287,8 +293,11 @@ error
 
 Throw `HttpError`/`GuardError`/`ValidationError` (src/errors.js) from
 anywhere; the worker turns them into `json(status, body)`. Anything else is a
-bug: the worker answers 500 `{ error: 'Something went wrong.' }` and calls
-`auditError` with the real exception.
+bug: the worker answers 500 `{ error: 'Something went wrong.' }` — or an
+empty 403 if the gate had not yet let the request in, so even a failure tells
+a stranger nothing — and calls `auditError` with the real exception (its
+detail names the path through `util.loggablePath`, never with an invitation
+token in it).
 
 All API responses are JSON. Errors are `{ error: string, code?: string, ... }`.
 
@@ -341,7 +350,7 @@ endpoints.
 | `streak_weekly_days` | JSON array of weekday numbers 0–6 (0 = Sunday) | `[6]` | `[6]` | settings.manage |
 | `streak_hebrew_holidays` | `'0'`/`'1'` | `'1'` | `'1'` | settings.manage |
 | `streak_region` | `diaspora` `israel` | `diaspora` | `diaspora` | settings.manage |
-| `streak_extra_dates` | JSON array of `{ "date": "YYYY-MM-DD", "label": string }` (≤ 366) | `[]` | `[]` | settings.manage |
+| `streak_extra_dates` | JSON array of `{ "date": "YYYY-MM-DD", "label": string }` (≤ 366; a label is 1–60 characters when written) | `[]` | `[]` | settings.manage |
 | `streak_leaderboard` | `all` `managers` `off` | `all` | `off` | settings.manage |
 
 Blank strings, `null`, booleans and objects submitted as values are
@@ -351,7 +360,8 @@ where the range allows it (A §14.11).
 `policy.js` exports:
 
 ```js
-SETTINGS                       // registry: { [key]: { default, perm, description, type, options?, min?, max?,
+SETTINGS                       // registry: { [key]: { key, label, default, unrecognised, perm, description, type,
+                               //                      options?, min?, max?,
                                //                      parse(raw) → value, serialize(input) → string (throws ValidationError) } }
 resolvePolicy(env) → object    // { access_mode, deny_style, gate_open: {open, until, forever, raw}, country_allow,
                                //   country_deny, block_tor, ..., streak: {...} } — every key parsed; one query
@@ -414,7 +424,9 @@ Signatures are binding. "rc" means the request context (§4.1).
 ```js
 LIMITS = {
   login_ip:        { max: 20,  windowSec: 600 },   // per IP (allowlisted IPs: max 200)
-  login_id:        { max: 10,  windowSec: 900 },   // per normalised identifier
+  login_id:        { max: 10,  windowSec: 900 },   // per normalised identifier (users.canonicalIdentifier — what the lookup
+                                                    // matches); a device that has signed in to the account before has its own
+                                                    // bucket per account and device (signin.knownDeviceLoginSubject, D6)
   mfa_user:        { max: 5,   windowSec: 900 },   // factor attempts, login AND step-up
   otp_send:        { max: 5,   windowSec: 900 },   // codes sent per user
   setup_ip:        { max: 5,   windowSec: 3600 },
@@ -425,13 +437,23 @@ LIMITS = {
   device_code_user:{ max: 10,  windowSec: 3600 },  // self-approve code guesses
 }
 charge(env, kind, subject, nowMs, { max }?) → { allowed, count, retryAfterSec }
-    // Inserts the attempt AND prunes rows older than 1 day in the same batch,
-    // then counts. Charged BEFORE the check it protects (A §6).
+    // Counts the window first: a bucket that is already full refuses WITHOUT
+    // inserting, so refused traffic never grows the table (SPEC §16.34).
+    // Otherwise inserts the attempt AND prunes rows older than 1 day in the
+    // same batch, then counts, and that count decides. Charged BEFORE the
+    // check it protects (A §6).
 peek(env, kind, subject, nowMs) → count
 clear(env, kind, subject) → void
 ```
 
 The per-IP login bucket is **never cleared on success** (B trap 4).
+
+Every per-address kind (`login_ip`, `setup_ip`, `request_ip`, `fp_ip`,
+`invite_ip` — the kinds named `*_ip`) is keyed on the caller's **network**,
+derived inside ratelimit.js with `ip.rateLimitNetwork`: an IPv4 address is
+itself, an IPv6 address is its `/64` (`2a02:1210:5c00:9e00::/64`). One line
+or one server is handed a whole /64; keyed per address it would have 2^64
+buckets. An address that does not parse shares the `?` bucket.
 
 ### 7.2 ip.js
 
@@ -439,6 +461,7 @@ The per-IP login bucket is **never cleared on success** (B trap 4).
 parseIp(s) → { v: 4|6, bytes: Uint8Array } | null      // strict; IPv4-mapped IPv6 → v4
 normalizeIp(s) → string | null                          // canonical text (RFC 5952 for v6)
 parseCidr(s) → { v, bytes, prefix } | null              // bare address = full prefix; host bits must be zero
+rateLimitNetwork(s) → string | null                     // IPv4: the address; IPv6: its /64 ('2001:db8:1:2::/64')
 normalizeCidr(s) → string | null
 cidrContains(cidr, ip) → bool                           // strings or parsed; never throws
 isPrivateOrReserved(cidr) → bool                        // RFC1918, loopback, link-local, CGNAT, ULA, multicast, doc ranges, etc.
@@ -496,13 +519,20 @@ computeDeadline(lastAtMs, cfg) → { deadline, base, anchor, leewayDays, graceAp
                                    opening: { from, to, names } | null }   // the run the sign-in fell inside
     // from/to are 'YYYY-MM-DD'
 streakStatus(row, nowMs, cfg) → status        // PURE — never writes (A §10 "read without rewriting")
-touchStreak(env, userId, nowMs, cfg) → status | null   // NEVER throws; null on any failure
+touchStreak(env, userId, nowMs, cfg, { onError }?) → status | null   // NEVER throws; null on any failure,
+                                              // which is handed to onError (completeSignIn audits streak.error)
 getStreak(env, userId, nowMs, cfg) → status
 streakHistory(env, userId, nowMs, cfg, days = 84) → [{ day, counted, protected, names, today, future }]
 upcomingProtected(cfg, nowMs, days = 21) → [{ day, names }]
 leaderboard(env, nowMs, cfg, limit = 10) → [{ user_id, full_name, current, longest }]
 adjustStreak(env, userId, { current, longest }, nowMs, cfg) → { prior, row }   // admin restore; caller audits
+restoreStreak(env, userId, prior, nowMs, { expect }?) → { prior, row }   // the 'streak' reverter (§4.2.1): put `prior`
+    // back (delete the row when null). Conditional on the live row as read; with `expect` (the undo
+    // payload's `wrote`) it is refused — GuardError 409 changed_since — unless the live row still holds
+    // exactly those STREAK_FIELDS, so a sign-in since the adjustment is never wiped
+STREAK_FIELDS = ['current', 'longest', 'total_days', 'started_day', 'last_day', 'last_at']
 streakRules(cfg) → { window_hours, reentry_grace_hours, max_leeway_days, calendar: string }
+DEFAULT_TIMEZONE = 'America/New_York'; FUTURE_HOLD_MS = 5 min; AT_RISK_HOURS = 6; RETAIN_DAYS = 400; MAX_ADJUST = 100000
 
 status = {
   state: 'none' | 'active' | 'at_risk' | 'paused' | 'lapsed' | 'held',
@@ -516,6 +546,7 @@ status = {
   hours_left,         // number (1 decimal) or null
   protected_today: { names } | null,
   timezone,
+  repaired?,          // touchStreak only: 'unreadable_last_at' when it restarted an unreadable row
 }
 ```
 
@@ -635,6 +666,7 @@ A TOTP row that will not decrypt is **refused** and audited as
 // users.js
 getUser(env, id) → row | null
 findUserByIdentifier(env, identifier) → row | null       // email or username, case-insensitive
+canonicalIdentifier(identifier) → { kind: 'email'|'username', value } | null   // the one normal form the lookup and login_id share
 listUsers(env, { status?, q?, role?, managerId?, limit, offset }) → { users: publicUser[], total }
 publicUser(row, role?) → object                          // §4.5
 validatePassword(pw, { email, username }?) → void | throws ValidationError
@@ -663,7 +695,7 @@ lookupInvitation(env, token, nowMs) → { invitation, user } | null    // unused
 acceptInvitation(rc, token, { password, full_name? }) → user          // sets password, activates, approves rc.device (minting one if needed)
 revokeInvitation(rc, invitationId), reissueInvitation(rc, userId) → {token, url, expires_at}
 listInvitations(env, { pending }) → rows (no token material)
-createAccessRequest(rc, { email, full_name, reason }) → { id }      // request_ip rate limit; records ip/country/visitor/risk
+createAccessRequest(rc, { email, full_name, reason }) → { ok }      // request_ip rate limit; records ip/country/visitor/risk; trims the table in the same batch (§11)
 listAccessRequests(env, { status }) → rows
 approveAccessRequest(rc, id, { role_id }) → { user, invitation }      // creates the invited user + invitation
 denyAccessRequest(rc, id) → void
@@ -698,6 +730,13 @@ findDeviceByCode(env, code) → row | null
 setDeviceStatus(rc, deviceId, status, { label? }) → { prior, row }   // 'pending' | 'approved' | 'blocked'; blocking/revoking drops grace + sessions on that device
 renameDevice(rc, deviceId, label) → { prior, row }
 revokeDevice(rc, deviceId) → void                          // status back to 'pending', grace dropped, sessions revoked
+    // Withdrawing trust (block, approved → pending, revoke) runs two guards first:
+    //  - the caller's OWN device: blocking is refused; un-approving is refused
+    //    (409 self_lockout) unless gate.evaluateGate, asked about this request
+    //    with the device as it would be, still answers 'all' (lockdown,
+    //    invite_only, allowlist off the allowlist and device gating all need it);
+    //  - every ACTIVE account in device_users for that device must rank below the
+    //    caller (rbac.assertCanActOn, Super Admins peers, self allowed) → 403 rank.
 listDevices(env, { status?, userId?, limit }) → rows (+ users who signed in on each)
 deviceLabelFromUa(ua, hints) → 'Chrome on macOS'          // UA first; client hints are a bonus (A §14.7)
 
@@ -710,12 +749,15 @@ dropGrace(env, { userId?, deviceId? }) → void
 // network.js
 tierForIp(env, ip, nowMs) → { tier, entry } | null          // live entries only; most specific wins; tie → stricter
 isIpBlocked(env, ip, nowMs) → bool
+    // both read EVERY live row, a page of 10,000 at a time by id — never just the
+    // oldest page, which once left the newest blocks shown active but unenforced
 listAllowed(env, nowMs), listBlocked(env, nowMs) → rows with { active, covers_ip? }
 addAllowed(rc, input) → row      // { cidr, tier 1–4, label?, owner?, user_id?, expires_at? | expires_in_hours? }
                                  // refuses private/reserved and whole-family (§A 4); tier 4 gets 24h if no expiry
 editAllowed(rc, id, patch) → { prior, row }
 removeAllowed(rc, id) → { row }  // the anti-lockout checks live in guards.js and are called by the API AND the reverter
 addBlocked(rc, input) → row, removeBlocked(rc, id) → { row }
+    // addBlocked refuses (409 blocklist_full, with a sentence) once 10,000 blocks are live
 
 // fingerprint.js
 edgeSignals(request, cf) → { ip, country, asn, as_org, colo, city, tls_version, tls_cipher, http_protocol,
@@ -730,6 +772,8 @@ fingerprintHash(edge, client) → hex, visitorId(edge, client) → hex   // visi
 recordFingerprint(rc, { client }) → { hash, visitor_id, risk }  // upsert + trim (by last_seen AND count)
 FP_COOKIE = '__Host-fp'; fpCookie(env, hash, risk, nowMs) → Set-Cookie; readFpCookie(rc) → { hash, risk } | null
 recordVisit(rc, { decision, reason }) → void                  // + trim by count and age; never throws
+    // the path is stored through util.loggablePath: the invitation lookup's
+    // token (and any token-length segment) becomes ':token' (SPEC §13.6)
 
 // gate.js
 evaluateGate(rc) → {
@@ -777,7 +821,7 @@ Shell path sets (GET unless noted). Every shell also allows `/healthz`,
 | setup | `/`, `/setup` | `/js/setup.js` | `GET /api/setup/status`, `POST /api/setup` |
 | request | `/`, `/request-access` | `/js/request.js`, `/js/fp.js` | `POST /api/access-request`, `POST /api/fp` |
 | login | `/`, `/login` | `/js/login.js`, `/js/fp.js`, `/js/webauthn.js` | `POST /api/fp`, `GET /api/auth/whoami`, `POST /api/auth/login` (answers `403 { fingerprint_required: true }` until a fingerprint is on file), `POST /api/auth/mfa/*` |
-| invite | `/invite` | `/js/invite.js`, `/js/fp.js` | `GET /api/invite/:token`, `POST /api/invite/accept`, `POST /api/fp` |
+| invite | `/invite` | `/js/invite.js`, `/js/fp.js` | `GET /api/invite/:token`, `POST /api/invite/lookup`, `POST /api/invite/accept`, `POST /api/fp` |
 | pending | any navigation shows `/pending` | `/js/pending.js` | `GET /api/device/status`, `GET /api/diag` |
 
 ### 7.9 signin.js
@@ -867,7 +911,8 @@ direct requests for `*.html` paths are 404.
 |---|---|---|
 | GET /api/setup/status | none | → `{ needed: bool, org_name }` (setup shell only) |
 | POST /api/setup | none | `{ setup_key, email, full_name, password }` → completeSignIn response. Key compared in constant time; setup_ip limit; one-shot claim row in `meta` that **expires after 10 minutes** (B trap 3); creates the Super Admin (`users.createOwner`), allowlists the caller's IP as tier 1 (`/32` or `/128`) — **skipped with a notice when the address is private/reserved** (e.g. `wrangler dev` reports loopback), since the approved device is then the way back in — approves the device, signs in pinned to `mfa_enroll`. Afterwards the route is unreachable. |
-| GET /api/invite/:token | none | → `{ email, full_name, org_name, expires_at }` or 404; invite_ip limit |
+| GET /api/invite/:token | none | → `{ email, full_name, org_name, expires_at }` or 404; invite_ip limit. A request whose `Sec-Fetch-Site` is present and not `same-origin` (an `<img>` on another site) gets the same 404 and is not charged, so cross-site loads cannot spend a shared office address's bucket |
+| POST /api/invite/lookup | none | `{ token }` → the same as `GET /api/invite/:token` (invite_ip limit). The token travels in the body, so no URL — and no proxy, history or path log — ever holds it; the page should use this, and the GET goes once it does |
 | POST /api/invite/accept | none | `{ token, password, full_name? }` → completeSignIn response |
 | POST /api/access-request | none | `{ email, full_name, reason }` → `{ ok: true }` (identical whether or not the email is known) |
 | POST /api/fp | none | `{ signals }` → `{ ok: true }`; sets fp cookie |
@@ -905,14 +950,21 @@ charges `mfa_user` before verifying.
 | GET /api/me/fingerprint | session | own latest fingerprint, risk score and reasons |
 | GET /api/me/step-up | session | `{ methods, destinations }` |
 | POST /api/me/step-up/code, /send, /otp, /passkey/options, /passkey/verify | session | as the login factor endpoints, but bound to the session; success → `markStepUp` |
-| POST /api/me/mfa/totp/begin | pinned | → `{ secret_grouped, otpauth, qr }` |
-| POST /api/me/mfa/totp/confirm | pinned | `{ code }` → `{ backup_codes: [...] \| null, pinned }`; marks step-up |
+| POST /api/me/mfa/totp/begin | pinned (+ step-up\*) | → `{ secret_grouped, otpauth, qr }` |
+| POST /api/me/mfa/totp/confirm | pinned (+ step-up\*) | `{ code }` → `{ backup_codes: [...] \| null, pinned }`; marks step-up **only** when the account had no factor before |
 | DELETE /api/me/mfa/totp | session + step-up | canDropFactor |
-| POST /api/me/mfa/passkey/options | pinned | registration options |
-| POST /api/me/mfa/passkey/register | pinned | `{ credential, label }` → `{ passkey, backup_codes, pinned }` |
+| POST /api/me/mfa/passkey/options | pinned (+ step-up\*) | registration options |
+| POST /api/me/mfa/passkey/register | pinned (+ step-up\*) | `{ credential, label }` → `{ passkey, backup_codes, pinned }` |
 | PATCH /api/me/mfa/passkey/:id | session | `{ label }` |
 | DELETE /api/me/mfa/passkey/:id | session + step-up | canDropFactor |
 | POST /api/me/mfa/backup/regenerate | session + step-up | → `{ backup_codes }` (shown once) |
+
+\* Adding a factor needs a fresh step-up whenever the account can already
+prove itself (`availableMethods` is not empty) and the session is not pinned
+to `mfa_enroll`. Otherwise a session whose step-up has gone stale could
+register a key of its own, step up with it and remove the owner's factors
+(SPEC §7.9). A first factor, or one added under the enrolment pin (which
+cannot reach the step-up routes), needs only the session.
 
 #### Admin (people, roles, devices, sessions, streaks, audit — `admin.js`)
 
@@ -921,7 +973,7 @@ charges `mfa_user` before verifying.
 | GET /api/admin/overview | any admin-console perm — counts the caller may see |
 | GET /api/directory | directory.view |
 | GET /api/admin/users · GET /api/admin/users/:id | users.view (or team.view for own reports) |
-| POST /api/admin/users | users.invite — `{ email, full_name, role_id?, ... }` → `{ user, invitation: { url, expires_at }, emailed }`; a missing `role_id` means the `employee` role (a manager cannot list roles) |
+| POST /api/admin/users | users.invite — `{ email, full_name, role_id?, ... }` → `{ user, invitation: { url, expires_at }, emailed }`; a missing `role_id` means the `employee` role (a manager cannot list roles). **+ step-up** when the role carries a danger permission (`rbac.roleCarriesDanger`: the Super Admin role, unreadable permissions, or any danger key) — minting a person into it is the same outcome as `users.roles` |
 | PATCH /api/admin/users/:id | users.edit |
 | POST /api/admin/users/:id/status | users.suspend (`active`↔`suspended`) / users.disable (`disabled`↔`active`) |
 | POST /api/admin/users/:id/role | users.roles — `{ role_id, perm_grants, perm_denies }` |
@@ -931,13 +983,13 @@ charges `mfa_user` before verifying.
 | POST /api/admin/users/:id/logout | users.suspend |
 | POST /api/admin/users/:id/revoke-devices | users.suspend |
 | GET/POST /api/admin/users/:id/destinations · DELETE …/destinations/:did | destinations.manage (reserved) |
-| POST /api/admin/users/:id/invitation | users.invite — reissue |
+| POST /api/admin/users/:id/invitation | users.invite — reissue (rank guard on the invitee; **+ step-up** when their role carries a danger permission) |
 | POST /api/admin/users/:id/streak | streaks.manage — `{ current, longest, reason }` |
 | GET /api/admin/invitations · POST /api/admin/invitations/:id/revoke | users.invite |
-| GET /api/admin/requests · POST …/:id/approve `{ role_id }` · POST …/:id/deny | requests.manage |
+| GET /api/admin/requests · POST …/:id/approve `{ role_id }` · POST …/:id/deny | requests.manage (approve: **+ step-up** when `role_id` carries a danger permission, as for an invitation) |
 | GET /api/admin/roles · GET /api/admin/permissions | roles.view |
 | POST /api/admin/roles · PATCH /api/admin/roles/:id · DELETE /api/admin/roles/:id | roles.manage (reserved) |
-| GET /api/admin/devices · POST …/:id/approve · …/:id/block · …/:id/unblock · …/:id/rename · DELETE …/:id | devices.view / devices.approve / devices.manage (the console approves by typed code by matching the pending list, then posting `{ code }` to …/:id/approve) |
+| GET /api/admin/devices · POST …/:id/approve · …/:id/block · …/:id/unblock · …/:id/rename · DELETE …/:id | devices.view / devices.approve / devices.manage (the console approves by typed code by matching the pending list, then posting `{ code }` to …/:id/approve). Each device's `code` is returned only to holders of `devices.approve` (`null` otherwise). Approve answers 409 `not_pending` unless the device is waiting; unblock 409 `not_blocked` unless it is blocked. Block, revoke and un-approve are rank-guarded on the device's users (§7.8) |
 | GET /api/admin/sessions · DELETE /api/admin/sessions/:ref | sessions.view / sessions.revoke |
 | GET /api/admin/streaks | streaks.view_all (all) or team.view (own reports) |
 | GET /api/admin/audit | audit.view — `?action=&actor=&target_type=&target_id=&outcome=&severity=&q=&before_seq=&limit=` → `{ entries, next_before_seq }`; each entry has `revertible`, `reverted_by` — **never** `undo_payload` |
@@ -948,7 +1000,7 @@ charges `mfa_user` before verifying.
 
 | method path | perm |
 |---|---|
-| GET /api/admin/settings | settings.view → `{ settings: [{ key, value, raw, default, perm, type, options, min, max, description, can_edit }] }` |
+| GET /api/admin/settings | settings.view → `{ settings: [{ key, label, value, raw, default, perm, type, options, min, max, description, can_edit }] }` |
 | PUT /api/admin/settings | per key (§5) — `{ changes: { key: value } }` → `{ ok, applied: [...], warnings: [...], notices: [...] }`; blocking guards → 409 `{ code: 'self_lockout', error }` |
 | GET /api/admin/gate · POST /api/admin/gate/open `{ hours }` or `{ forever: true }` · POST /api/admin/gate/close | gate.open (reserved) — replies `{ open, until, forever, lockdown, now }`; the console counts down against the server's `now`, never the browser clock |
 | GET /api/admin/network | network.view → `{ allow, block, you: { ip, country, asn, tier, covered_by } }` |
@@ -968,7 +1020,12 @@ Blocking (409 `self_lockout`):
 - deleting the last live allowlist entry;
 - deleting/editing/expiring an entry when no remaining live entry would cover
   the caller's address;
-- a block range containing the caller's address;
+- a block range containing the caller's address (and `403 rank` when an
+  active account seen inside the range lately — a live session's address or
+  a ledger device's last address in the last 30 days — ranks at or above the
+  caller; Super Admins are peers);
+- blocking the caller's own device, or un-approving it while the gate needs
+  that approval to admit them (devices.js, §7.8);
 - `country_allow` / `country_deny` that would refuse the caller's country,
   unless the caller's IP is allowlisted;
 - `block_tor` / `block_datacenter` / `block_automation` that the caller
@@ -1007,7 +1064,10 @@ repeat at most 8 rounds:
     count   = |{ d : lastDay < d ≤ endDay, isProtected(d) }|
     closed  = the latest d with lastDay < d < endDay, isProtected(d) and not isProtected(d+1)
               (a protected block that ENDS inside the window), or none
-    next    = base + min(count, maxLeewayDays)·D
+    next    = base + Σ len(d) over the first min(count, maxLeewayDays) of those protected days
+              // len(d) = zonedMidnightUtc(d + 1) − zonedMidnightUtc(d): 23 or 25 hours across a clock
+              // change, so a sign-in just before a block and one just inside it agree (the clock
+              // does not run in protected time, whatever the clocks do); D if unreadable
     if closed and graceHours > 0:
         next = max(next, zonedMidnightUtc(closed + 1) + graceHours·H)   // re-entry grace (B)
     next    = min(next, hardCap)
@@ -1023,37 +1083,57 @@ Sunday rather than 5am (11pm Friday already reaches 5am Monday through the
 leeway day). Signing in on Saturday night opens the window at midnight, when
 Shabbos ends in the day model: 9pm Saturday → 6am Monday.
 
-**Invariant (tested every 30 minutes over two years):** a later sign-in never
+**Invariant (tested every 30 minutes over two years, and every 15 minutes
+around each clock change 2024–2030 in zones where a protected day is one):**
+a later sign-in never
 produces an earlier deadline. Without the anchor rule a sign-in early on
 Shabbos did exactly that (Fri 11:30pm → Mon 5:30am, then Sat 12:10am → Sun
 6:10am).
 
-`touchStreak(env, userId, nowMs, cfg)` — called by `completeSignIn` only:
+`touchStreak(env, userId, nowMs, cfg, { onError }?)` — called by `completeSignIn` only:
 
 - No row → `current = longest = total_days = 1`, `started_day = last_day =
   today`, `last_at = now`.
-- `last_at` unreadable → restart at 1 (longest kept) and return the status
-  with `repaired: 'unreadable_last_at'`; `completeSignIn` audits
-  `streak.error` when it sees that field (streak.js itself never imports the
-  audit module).
+- `last_at` unreadable → restart at 1 (longest kept; `total_days + 1` unless
+  `last_day` already claims today) and return the status with
+  `repaired: 'unreadable_last_at'`; `completeSignIn` audits `streak.error`
+  when it sees that field (streak.js itself never imports the audit module).
+  A `NULL` `last_at` on a row whose `current` is 0 (an administrator set it to
+  0 before any sign-in) is a plain restart and is not reported.
 - `last_at` more than 5 minutes in the future (a clock moved, a restore) →
   **hold**: change nothing (A §11).
-- Same local day as `last_day` → `last_at = max(last_at, now)` only.
+- Same local day as `last_day` → `last_at = max(last_at, now)`; and a real
+  sign-in is always logged: when today has no `streak_days` row yet (an
+  administrator's adjustment claims today without one) the row is written and
+  `total_days + 1`; when the stored `current` is 0 (set to 0 today) it restarts
+  at 1 (`started_day = today`).
+- `last_day` after today (a zone change) → `last_at = max(last_at, now)` only.
 - Later day: `now ≤ computeDeadline(last_at).deadline` → `current + 1`, else
   restart at 1 (`started_day = today`). `longest = max`, `total_days + 1`,
   `last_day = today`, `last_at = now`, insert `streak_days(today)`, prune that
-  user's `streak_days` older than 400 days in the same batch.
-- Concurrency: the update is conditional on the `last_day` it read
-  (`… WHERE user_id = ? AND last_day IS ?`); zero rows changed means another
-  sign-in won — re-read and treat as same-day. First insert is
-  `ON CONFLICT DO NOTHING` + re-read. No double counting (A §11).
-- Wrapped whole in try/catch → `null`. The e2e suite drops the `streaks` table
-  and asserts sign-in still succeeds (A §10).
+  user's `streak_days` older than 400 days in the same batch. The day-log
+  insert is itself conditional on the `streaks` row now holding this very
+  sign-in (`last_day = today AND last_at = now`), so a write that lost a race
+  never leaves a cell it did not count.
+- Concurrency: every update is conditional on the values it read — the later-
+  day update on `last_day` (`… WHERE user_id = ? AND last_day IS ?`), the
+  same-day update on `last_day`, `last_at` and `current`, the unreadable-row
+  restart on `last_at`; zero rows changed means another sign-in won — re-read
+  and treat as same-day (`last_at` moves forward, compare-and-set). First
+  insert is `ON CONFLICT DO NOTHING` + re-read. No double counting (A §11).
+- Wrapped whole in try/catch → `null`, handing the exception to
+  `opts.onError` (`touchStreak(env, userId, nowMs, cfg, { onError })`), with
+  which `completeSignIn` audits `streak.error` at critical severity with the
+  real message (§0.4). The e2e suite drops the `streaks` table and asserts
+  sign-in still succeeds, exactly one such row is written, and the admin
+  overview and person panel still load (streak `null`) (A §10).
 
 `streakStatus` (read-only, never writes):
-`none` (no row) · `held` (last_at in the future) · `lapsed` (now > deadline →
-display `current` 0, longest intact) · `paused` (today is protected and not yet
-counted) · `at_risk` (not counted today and < 6h left) · `active`.
+`none` (no row) · `held` (last_at more than 5 minutes in the future) ·
+`lapsed` (now > deadline, or the stored `current` is 0, or `last_at` is
+unreadable → display `current` 0, longest intact) · `paused` (today is
+protected and not yet counted) · `at_risk` (not counted today and < 6h left) ·
+`active`.
 
 ---
 
@@ -1061,6 +1141,12 @@ counted) · `at_risk` (not counted today and < 6h left) · `active`.
 
 - One HTML file per page in `public/`, each loading `/css/app.css` and one
   module script `/js/<page>.js`. No inline script or style. No `style=""`.
+  Every `<form>` in the markup is `method="post"` with no `action`: one
+  submitted before its module binds posts to its own page (no page answers)
+  instead of putting the fields — a password, the setup key — in the URL.
+  Every page ships an empty `<div id="toasts" class="toasts" role="status"
+  aria-live="polite">`, so the first toast is announced; a `danger` toast is
+  `role="alert"`.
 - `public/js/common.js` exports the shared kit: `h(tag, attrs, ...children)`
   (sets attributes and `textContent` only — `on*` attributes become
   `addEventListener`), `api(method, path, body)` (JSON, same-origin, throws
@@ -1085,11 +1171,17 @@ counted) · `at_risk` (not counted today and < 6h left) · `active`.
   none the browser can offer; "use a different method" keyed off what the
   browser can offer; a cancelled passkey dialog returns to the chooser; a spent
   challenge turns Retry into "Start over"; after success ask `whoami` and say
-  plainly when the cookie did not stick.
+  plainly when the cookie did not stick. A pinned sign-in goes to the pinned
+  step with `?next=` carried along (`/account?pin=…&next=…`). A page load that
+  finds the browser already signed in waits for the fingerprint report (sending
+  another if it failed) before it leaves, and does not leave again for the
+  address it was just sent to within 30 s (fingerprint_gate would show it this
+  page again: a loop) — it says so instead.
 - The dashboard leads with the streak: the flame and count, longest, the
   state in words, the exact deadline in the portal's time zone, "paused for
   Shabbos" when today is protected, the 12-week history strip (counted /
-  protected / missed / today), the next three weeks of protected days, the
+  protected / missed / today / before they joined — from `/api/me`
+  `user.created_at` in the portal zone), the next three weeks of protected days, the
   rules in one sentence, and the leaderboard when the setting allows.
 
 ### 10.1 Client fingerprint signals (`POST /api/fp { signals }`)
@@ -1140,6 +1232,7 @@ chars and arrays at 64 items, and rejects a body over 16 KiB.
 | sessions | `createSession` | absolute-expired or revoked more than 7 days ago |
 | devices (pending) | `ensureDevice` | pending and unseen 30 days; cap 2,000 pending |
 | streak_days | `touchStreak` | that user's rows older than 400 days |
+| access_requests | `createAccessRequest` | made (pending) or decided more than 90 days ago; keep newest 2,000 |
 | audit_log | never | paged in the UI; the chain verifies from genesis |
 | allowed_ips | never | expired rows are kept and excluded by queries |
 

@@ -167,6 +167,16 @@ export function canAll(authz, perms) {
   return Array.isArray(perms) && perms.every((p) => can(authz, p));
 }
 
+// Does handing out this role hand out something dangerous? Every permission
+// (the Super Admin role), permissions that cannot be read (they might be
+// anything), or any danger permission. A roles row, permissions as stored.
+export function roleCarriesDanger(row) {
+  if (!row || typeof row !== 'object') return true;
+  if (row.key === SUPER_ROLE_KEY || isSuperRole(row)) return true;
+  const { list, unreadable } = readList(row.permissions);
+  return !!unreadable || list.some((k) => k === '*' || (typeof k === 'string' && DANGER.has(k)));
+}
+
 export function routeNeedsStepUp(perm) {
   const list = typeof perm === 'string' ? [perm] : Array.isArray(perm) ? perm : [];
   return list.some((k) => typeof k === 'string' && DANGER.has(k));

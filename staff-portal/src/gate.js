@@ -48,7 +48,7 @@ const SHELLS = Object.freeze({
     'POST /api/fp', 'GET /api/auth/whoami', 'POST /api/auth/login', 'POST /api/auth/mfa/code',
     'POST /api/auth/mfa/send', 'POST /api/auth/mfa/otp', 'POST /api/auth/mfa/passkey/options', 'POST /api/auth/mfa/passkey/verify',
   ]),
-  invite: new Set([...COMMON, 'GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'POST /api/invite/accept', 'POST /api/fp']),
+  invite: new Set([...COMMON, 'GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'POST /api/invite/lookup', 'POST /api/invite/accept', 'POST /api/fp']),
   pending: new Set([...COMMON, 'GET /pending', 'GET /js/pending.js', 'GET /api/device/status', 'GET /api/diag']),
 });
 const INVITE_LOOKUP = /^\/api\/invite\/[A-Za-z0-9_-]{1,256}$/;

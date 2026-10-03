@@ -19,7 +19,7 @@ import { canAll, routeNeedsStepUp, requireStepUp } from './src/rbac.js';
 import { auditError } from './src/audit.js';
 import { HttpError, forbidden } from './src/errors.js';
 import { requireSecret } from './src/crypto.js';
-import { json, empty, redirect, now } from './src/util.js';
+import { json, empty, redirect, now, loggablePath } from './src/util.js';
 import { harden, servePage, serveAsset, isNavigation, invitePass } from './src/pages.js';
 import { pinTarget } from './src/signin.js';
 
@@ -131,7 +131,7 @@ async function handle(request, env, ctx) {
     if (e instanceof HttpError) res = errorResponse(e);
     else {
       await auditError(rc || { env, nowMs: now(env) }, 'error', e, {
-        detail: `Unexpected failure on ${request.method} ${url.pathname}.`,
+        detail: `Unexpected failure on ${request.method} ${loggablePath(url.pathname)}.`,
       });
       // Before the gate has let a request in, even a failure says nothing.
       res = rc && rc.gate && rc.gate.allowed !== 'none' ? json(500, { error: 'Something went wrong.' }) : empty(403);

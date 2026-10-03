@@ -11,12 +11,16 @@ import { addDestination, removeDestination } from '../../src/mfa/otp.js';
 
 const PHONE = '+15555550123';
 
-async function world({ sms = true, email = false } = {}) {
+// totp: Amy sets up an authenticator BEFORE the destination is added. Once
+// she can prove herself with a text, adding a factor needs that proof first
+// (SPEC §7.9), and these tests are not about step-up.
+async function world({ sms = true, email = false, totp = false } = {}) {
   const provider = fakeProvider();
   const vars = { __fetch: provider.fetch, ...(sms ? TWILIO : {}), ...(email ? { RESEND_API_KEY: 're_test_key', MAIL_FROM: 'Portal <portal@acme.com>' } : {}) };
   const env = freshEnv({ vars });
   const owner = await bootstrap(env);
   const amy = await makeUser(env, owner.client, { email: 'amy@acme.com' });
+  if (totp) await enrollTotp(env, amy.client);
   const rc = await actorRc(env, owner.user);
   const smsDest = await addDestination(rc, amy.user.id, { kind: 'sms', address: PHONE, label: 'Mobile' });
   return { env, owner, amy, provider, rc, smsDest };
@@ -49,8 +53,7 @@ test('a code as the only method is sent automatically and signs in', async () =>
 });
 
 test('a code goes out unasked only when it is the ONLY method', async () => {
-  const { env, amy, provider } = await world();
-  await enrollTotp(env, amy.client);
+  const { env, amy, provider } = await world({ totp: true });
   const r = await login(amy.client);
   assert.deepEqual(r.body.methods, ['totp', 'backup', 'sms']);
   assert.equal(r.body.sent, null);
@@ -67,8 +70,7 @@ test('a code goes out unasked only when it is the ONLY method', async () => {
 });
 
 test('removing the destination stops a code already sent there being a way in', async () => {
-  const { env, amy, provider, rc, smsDest } = await world();
-  await enrollTotp(env, amy.client); // so the destination is not the last factor
+  const { env, amy, provider, rc, smsDest } = await world({ totp: true }); // so the destination is not the last factor
   const r = await login(amy.client);
   const send = await amy.client.post('/api/auth/mfa/send', { token: r.body.token, destination_id: smsDest.id });
   assert.equal(send.status, 200);
@@ -78,8 +80,7 @@ test('removing the destination stops a code already sent there being a way in', 
 });
 
 test('someone else’s destination id is refused and sends nothing', async () => {
-  const { env, owner, amy, provider, rc } = await world();
-  await enrollTotp(env, amy.client);
+  const { env, owner, amy, provider, rc } = await world({ totp: true });
   const bob = await makeUser(env, owner.client, { email: 'bob@acme.com' });
   const bobDest = await addDestination(rc, bob.user.id, { kind: 'sms', address: '+15555550999' });
   const r = await login(amy.client);
@@ -132,8 +133,7 @@ test('emailed codes work the same way', async () => {
 });
 
 test('sending is limited per person, and a provider failure is a polite 503', async () => {
-  const { env, amy, provider } = await world();
-  await enrollTotp(env, amy.client);
+  const { env, amy, provider } = await world({ totp: true });
   const r = await login(amy.client);
   const id = r.body.destinations[0].id;
   for (let i = 0; i < 5; i++) assert.equal((await amy.client.post('/api/auth/mfa/send', { token: r.body.token, destination_id: id })).status, 200);

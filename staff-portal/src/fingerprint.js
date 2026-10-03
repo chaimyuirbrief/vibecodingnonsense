@@ -21,7 +21,7 @@
 // The fingerprints table is keyed by a hash of CLIENT-CHOSEN input, so it is
 // trimmed by last_seen and by count on every write, never by id (B trap 6).
 
-import { iso, now, toInt, str, canonicalJson, cookie, clientIpRaw, utf8, MINUTE, DAY } from './util.js';
+import { iso, now, toInt, str, canonicalJson, cookie, clientIpRaw, utf8, loggablePath, MINUTE, DAY } from './util.js';
 import { sha256Hex, signToken, verifyToken } from './crypto.js';
 import { normalizeIp } from './ip.js';
 import { parseUa } from './devices.js';
@@ -602,7 +602,7 @@ export async function recordVisit(rc, opts) {
           country,
           Number.isFinite(asn) ? asn : null,
           str(rc.method, 10).toUpperCase() || null,
-          str(rc.path, 512) || null,
+          str(loggablePath(rc.path), 512) || null,
           str(o.decision ?? rc.gate?.allowed, 16) || null,
           str(o.reason ?? rc.gate?.reason, 64) || null,
           hexOrNull(rc.fp?.hash),

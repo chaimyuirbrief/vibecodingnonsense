@@ -365,4 +365,30 @@ test('a stored gate value that is not "0", "1" or a future ISO instant reads as 
   }
 });
 
+
+// B trap 2, SPEC §16.18: a write path's catch records the REAL exception at
+// critical severity, then answers with its polite sentence — for every
+// settings, gate and network write (admin-security.js writing()).
+test('an unexpected failure in a settings or network write is audited at critical with the real message', async () => {
+  const env = freshEnv();
+  const owner = await bootstrap(env);
+  for (const [what, failOn, call] of [
+    ['settings', /INTO settings/i, () => owner.client.put('/api/admin/settings', { changes: { timezone: 'America/Chicago' } })],
+    ['allowlist', /INTO allowed_ips/i, () => owner.client.post('/api/admin/network/allow', { cidr: '185.15.56.0/24', tier: 2 })],
+    ['blocklist', /INTO blocked_ips/i, () => owner.client.post('/api/admin/network/block', { cidr: '91.198.174.0/24', reason: 'x' })],
+  ]) {
+    await stepUp(env, owner.client);
+    const n = auditRows(env).length;
+    env.DB.failOn = failOn;
+    const r = await call();
+    env.DB.failOn = null;
+    assert.equal(r.status, 500, `${what}: ${r.text}`);
+    assert.ok(!r.text.includes('injected'), `${what}: the caller gets the polite sentence, not the error`);
+    const rows = auditRows(env).slice(n).filter((x) => x.severity === 'critical');
+    assert.equal(rows.length, 1, `${what}: one critical row`);
+    assert.match(rows[0].error, /injected failure/, `${what}: the real message`);
+    assert.equal(rows[0].outcome, 'failure');
+  }
+});
+
 await run();

@@ -5,6 +5,8 @@ import { iso, HOUR, DAY } from '../../src/util.js';
 import { signToken, verifyToken } from '../../src/crypto.js';
 import { GuardError, ValidationError, HttpError } from '../../src/errors.js';
 import * as D from '../../src/devices.js';
+import { resolvePolicy } from '../../src/policy.js';
+import { edgeSignals } from '../../src/fingerprint.js';
 
 const HOSTILE = [null, undefined, NaN, Infinity, '', '   ', 'abc', {}, [], true, 0, Symbol('x')];
 const show = (v) => (typeof v === 'symbol' ? 'Symbol' : JSON.stringify(v) ?? String(v));
@@ -316,19 +318,94 @@ test('setDeviceStatus refuses hostile statuses, labels and ids without writing a
   assert.equal(JSON.stringify(env.DB.q('SELECT * FROM devices')), before);
 });
 
-test('self-lockout: you cannot block the device you are using, nor un-approve it while gating may be on', async () => {
+// A request context as buildContext makes it, for asking the gate about the
+// caller's own device.
+async function gateRc(env, { ip = '91.198.174.20', mode = 'allowlist', gating = false, device } = {}) {
+  const request = new Request('https://staff.example.com/', { headers: { 'cf-connecting-ip': ip, 'user-agent': CHROME_UA, 'accept-language': 'en-US' } });
+  const cf = { country: 'US', asn: 7922, asOrganization: 'Comcast Cable', tlsVersion: 'TLSv1.3', httpProtocol: 'HTTP/2' };
+  const policy = { ...(await resolvePolicy(env)), access_mode: mode, device_gating: gating };
+  return rcFor(env, { request, ip, cf, edge: edgeSignals(request, cf), fp: null, policy, device });
+}
+
+// GATE-1: the gate needs the caller's device approval in lockdown (allowlisted
+// AND approved), in invite_only, in the allowlist mode off the allowlist and
+// in request_access off it, and with device gating on — not only the last.
+test('self-lockout: you cannot block the device you are using, nor un-approve it wherever the gate needs that approval', async () => {
   const env = await makeEnvWithSchema();
+  const me = addUser(env);
   addDevice(env, 'my-device', 'approved');
-  const mine = { id: 'my-device', row: { status: 'approved' } };
+  env.DB.q('INSERT INTO allowed_ips (cidr, tier, created_at, updated_at) VALUES (?, 1, ?, ?)', '81.2.69.0/24', iso(env.__clock()), iso(env.__clock()));
+  const mine = { id: 'my-device', row: { id: 'my-device', status: 'approved' } };
   const guard = (e) => e instanceof GuardError && e.code === 'self_lockout' && e.status === 409;
-  await assert.rejects(D.setDeviceStatus(rcFor(env, { device: mine }), 'my-device', 'blocked'), guard);
-  await assert.rejects(D.setDeviceStatus(rcFor(env, { device: mine, policy: { device_gating: true } }), 'my-device', 'pending'), guard);
-  await assert.rejects(D.setDeviceStatus(rcFor(env, { device: mine, policy: undefined }), 'my-device', 'pending'), guard, 'unknown policy reads as gating on');
-  await assert.rejects(D.revokeDevice(rcFor(env, { device: mine, policy: { device_gating: true } }), 'my-device'), guard);
-  assert.equal(env.DB.q("SELECT status FROM devices WHERE id = 'my-device'")[0].status, 'approved');
-  // With gating off, un-approving your own device is only a sign-out.
-  await D.revokeDevice(rcFor(env, { device: mine, policy: { device_gating: false } }), 'my-device');
+  const as = async (o) => ({ ...(await gateRc(env, { device: mine, ...o })), user: me });
+
+  await assert.rejects(D.setDeviceStatus(await as({ mode: 'public' }), 'my-device', 'blocked'), guard, 'blocking is refused in every mode');
+  const needed = [
+    ['lockdown on the allowlist', { mode: 'lockdown', ip: '81.2.69.10' }],
+    ['invite_only on the allowlist', { mode: 'invite_only', ip: '81.2.69.10' }],
+    ['allowlist off the allowlist', { mode: 'allowlist' }],
+    ['request_access off the allowlist', { mode: 'request_access' }],
+    ['device gating on, allowlisted', { mode: 'allowlist', ip: '81.2.69.10', gating: true }],
+    ['device gating on, public', { mode: 'public', gating: true }],
+  ];
+  for (const [what, o] of needed) {
+    await assert.rejects(D.setDeviceStatus(await as(o), 'my-device', 'pending'), guard, `${what}: un-approve`);
+    await assert.rejects(D.revokeDevice(await as(o), 'my-device'), guard, `${what}: revoke`);
+  }
+  await assert.rejects(D.revokeDevice(rcFor(env, { device: mine, policy: undefined, user: me }), 'my-device'), guard, 'an unreadable policy is the restrictive one');
+  assert.equal(env.DB.q("SELECT status FROM devices WHERE id = 'my-device'")[0].status, 'approved', 'nothing was written');
+
+  // Where the approval is not what lets you in, un-approving your own device
+  // is only a sign-out.
+  await D.revokeDevice(await as({ mode: 'allowlist', ip: '81.2.69.10' }), 'my-device');
   assert.equal(env.DB.q("SELECT status FROM devices WHERE id = 'my-device'")[0].status, 'pending');
+  env.DB.q("UPDATE devices SET status = 'approved' WHERE id = 'my-device'");
+  await D.setDeviceStatus(await as({ mode: 'public' }), 'my-device', 'pending');
+  assert.equal(env.DB.q("SELECT status FROM devices WHERE id = 'my-device'")[0].status, 'pending');
+});
+
+// AUTHZ-1 / FO-4: withdrawing trust from a device signs out — and, wherever
+// approval matters, keeps out — everyone on it, so it is an action on each of
+// them (SPEC §5.5): every active account that signed in there must rank below
+// the caller.
+test('withdrawing trust from a device is refused when someone at or above the caller signs in on it', async () => {
+  const env = await makeEnvWithSchema();
+  const t = iso(env.__clock());
+  const roleOf = (k) => env.DB.q('SELECT id FROM roles WHERE key = ?', k)[0].id;
+  const person = (email, role) => {
+    env.DB.q('INSERT INTO users (email, full_name, status, role_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', email, email, 'active', roleOf(role), t, t);
+    return env.DB.q('SELECT * FROM users WHERE email = ?', email)[0];
+  };
+  const owner = person('owner@acme.com', 'super_admin');
+  const admin = person('admin@acme.com', 'admin');
+  const emp = person('emp@acme.com', 'employee');
+  const ledger = (deviceId, u) => env.DB.q('INSERT INTO device_users (device_id, user_id, first_seen, last_seen, sign_ins) VALUES (?, ?, ?, ?, 1)', deviceId, u.id, t, t);
+  for (const id of ['owner-laptop', 'emp-phone', 'shared-kiosk', 'admin-phone']) addDevice(env, id, 'approved');
+  ledger('owner-laptop', owner);
+  ledger('emp-phone', emp);
+  ledger('shared-kiosk', emp);
+  ledger('shared-kiosk', owner);
+  ledger('admin-phone', admin);
+  addSession(env, 's-owner', owner.id, 'owner-laptop');
+  const rank = (e) => e instanceof GuardError && e.code === 'rank' && e.status === 403;
+  const rc = rcFor(env, { user: admin, device: { id: 'admin-laptop', row: null } });
+
+  await assert.rejects(D.setDeviceStatus(rc, 'owner-laptop', 'blocked'), rank, 'block');
+  await assert.rejects(D.setDeviceStatus(rc, 'owner-laptop', 'pending'), rank, 'un-approve');
+  await assert.rejects(D.revokeDevice(rc, 'owner-laptop'), rank, 'revoke');
+  await assert.rejects(D.revokeDevice(rc, 'shared-kiosk'), rank, 'a device shared with someone above you');
+  assert.equal(env.DB.q("SELECT revoked_at FROM sessions WHERE id = 's-owner'")[0].revoked_at, null, 'the owner is still signed in');
+  assert.equal(count(env, "SELECT COUNT(*) AS n FROM devices WHERE status = 'approved'"), 4, 'nothing was written');
+
+  // Below you, or your own: as before. Extending trust is no action on anyone.
+  await D.setDeviceStatus(rc, 'emp-phone', 'blocked');
+  await D.revokeDevice(rc, 'admin-phone');
+  await D.setDeviceStatus(rc, 'emp-phone', 'pending');
+  await D.setDeviceStatus(rc, 'emp-phone', 'approved');
+  // A Super Admin acts on a peer; an account that is not active is no one to protect.
+  await D.setDeviceStatus(rcFor(env, { user: person('sue@acme.com', 'super_admin') }), 'owner-laptop', 'pending');
+  env.DB.q("UPDATE users SET status = 'disabled' WHERE id = ?", owner.id);
+  await D.revokeDevice(rc, 'shared-kiosk');
 });
 
 test('revokeDevice: back to pending, grace dropped, sessions revoked; a blocked device stays blocked', async () => {

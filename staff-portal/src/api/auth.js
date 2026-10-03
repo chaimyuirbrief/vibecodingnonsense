@@ -12,7 +12,7 @@ import { verifyPassword, burnPasswordCost, PASSWORD_ALGO } from '../crypto.js';
 import { charge } from '../ratelimit.js';
 import { audit } from '../audit.js';
 import { DEFAULT_PRIVACY_NOTICE } from '../policy.js';
-import { findUserByIdentifier, getUser, publicUser, isLocked, knownDeviceFor, recordLoginFailure, LOCK_AFTER } from '../users.js';
+import { canonicalIdentifier, findUserByIdentifier, getUser, publicUser, isLocked, knownDeviceFor, recordLoginFailure, LOCK_AFTER } from '../users.js';
 import { effectivePermissions } from '../rbac.js';
 import { graceValid } from '../grace.js';
 import { revokeSession, clearSessionCookie } from '../sessions.js';
@@ -22,7 +22,7 @@ import { checkTotp } from '../mfa/totp.js';
 import { consumeBackupCode } from '../mfa/backup.js';
 import { listDestinations, primaryDestination, sendCode, verifyCode } from '../mfa/otp.js';
 import { assertionOptions, verifyAssertion } from '../webauthn/webauthn.js';
-import { completeSignIn, INVALID_CREDENTIALS } from '../signin.js';
+import { completeSignIn, knownDeviceLoginSubject, INVALID_CREDENTIALS } from '../signin.js';
 
 const PASSWORD_INPUT_MAX = 4096;
 const CODE_INPUT_MAX = 64;
@@ -71,12 +71,24 @@ async function login(rc) {
   if (!ipLim.allowed) throw tooMany(ipLim.retryAfterSec);
   const b = await body(rc);
   const ident = typeof b.identifier === 'string' ? b.identifier.trim().toLowerCase().slice(0, 254) : '';
-  const idLim = await charge(env, 'login_id', ident || '?', t);
+  // The log names what was typed (§16.26); the bucket and the lookup use the
+  // one normal form, so spellings the lookup treats as one account cannot
+  // each have a fresh bucket. Anything that names no possible account shares
+  // one bucket.
+  const canon = canonicalIdentifier(ident);
+  const user = canon ? await findUserByIdentifier(env, ident) : null;
+  // D6: a stranger can spend the bucket for an account, never the one of a
+  // device that has signed in to it before — that device has a bucket of its
+  // own (per account and device), so junk sign-ins from elsewhere cannot keep
+  // the owner out of their own laptop. The lookup is not a credential check;
+  // the bucket is still charged before the password is.
+  const known = !!user && typeof rc.device?.id === 'string' && (await knownDeviceFor(env, user.id, rc.device.id));
+  const idSubject = known ? knownDeviceLoginSubject(user.id, rc.device.id) : canon ? canon.value : '?';
+  const idLim = await charge(env, 'login_id', idSubject, t);
   if (!idLim.allowed) throw tooMany(idLim.retryAfterSec);
   const password = typeof b.password === 'string' && b.password.length <= PASSWORD_INPUT_MAX ? b.password : null;
   const who = ident ? `'${ident.slice(0, 100)}'` : 'a blank name';
 
-  const user = ident ? await findUserByIdentifier(env, ident) : null;
   if (!user) {
     // Same work as a real check, so the clock does not tell them either.
     await burnPasswordCost(env, password ?? '');
@@ -105,7 +117,6 @@ async function login(rc) {
   // D6: a stranger can lock an account against strangers, never against a
   // device that has signed in to it before.
   if (isLocked(user, t)) {
-    const known = typeof rc.device?.id === 'string' && (await knownDeviceFor(env, user.id, rc.device.id));
     if (!known) {
       await audit(rc, {
         action: 'login.fail',

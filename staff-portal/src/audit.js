@@ -35,7 +35,11 @@ const ERROR_MAX = 2000;
 const STATE_MAX_BYTES = 16 * 1024;
 const UNDO_MAX_BYTES = 512 * 1024;
 const SCRUB_MAX_DEPTH = 12;
-const MAX_ATTEMPTS = 8;
+// A writer that loses the race re-reads the head and tries again (SPEC
+// §11.2). The budget is generous — about two seconds of jittered, capped
+// backoff — because giving up means an action that happened has no row.
+const MAX_ATTEMPTS = 50;
+const BACKOFF_CAP_MS = 64;
 const VERIFY_PAGE = 500;
 
 const enc = new TextEncoder();
@@ -191,9 +195,11 @@ async function readHead(db) {
   return head ? { seq: head.seq, hash: head.hash } : { seq: 0, hash: GENESIS_HASH };
 }
 
-// Writes from one request (or one test env) queue behind each other, so they
-// never race themselves. Writes from different requests or isolates race on
-// the conditional insert below and retry.
+// Writes to one database from one isolate queue behind each other — every
+// request's, not only one request's — so they never race themselves: a
+// stranger's flood of login failures in this isolate cannot crowd an
+// administrator's row out of the chain. Writes from different isolates race
+// on the conditional insert below and retry.
 const queues = new WeakMap();
 
 function serialised(key, fn) {
@@ -220,7 +226,7 @@ async function append(db, base) {
     }
     if (res && res.meta && res.meta.changes === 1) return { id: res.meta.last_row_id, seq: row.seq };
     // Lost the race to another writer: back off a little, re-read the head.
-    if (attempt < MAX_ATTEMPTS) await sleep(randomInt(2 ** attempt));
+    if (attempt < MAX_ATTEMPTS) await sleep(1 + randomInt(Math.min(2 ** attempt, BACKOFF_CAP_MS)));
   }
   throw new Error(`audit: gave up after ${MAX_ATTEMPTS} contended attempts`);
 }
@@ -232,7 +238,7 @@ export async function audit(rc, entry) {
     if (!env || !env.DB || !entry || typeof entry !== 'object') throw new Error('audit: needs rc.env and an entry');
     const nowMs = typeof rc.nowMs === 'number' && Number.isFinite(rc.nowMs) ? rc.nowMs : now(env);
     const base = buildRow(rc, entry, nowMs);
-    return await serialised(rc.ctx && typeof rc.ctx === 'object' ? rc.ctx : env.DB, () => append(env.DB, base));
+    return await serialised(env.DB, () => append(env.DB, base));
   } catch (e) {
     let action = '?';
     try {

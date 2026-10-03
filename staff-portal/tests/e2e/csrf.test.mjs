@@ -65,4 +65,22 @@ test('a form post (not JSON) cannot drive a JSON route even from our origin', as
   assert.equal(r.status, 401);
 });
 
+
+// The JSON-only body is the second brake (SPEC §3.4): a cross-site form with
+// enctype="text/plain" can send a body that IS valid JSON. From our own
+// origin, so only the content type stands in the way, it must read as no body.
+test('a JSON body sent as text/plain is no body, even from our origin', async () => {
+  const { env } = await world();
+  const before = count(env, 'SELECT COUNT(*) FROM sessions');
+  for (const ct of ['text/plain', 'text/plain;charset=UTF-8']) {
+    const r = await rawRequest(env, 'POST', '/api/auth/login', {
+      ip: OWNER_IP,
+      headers: { origin: env.ORIGIN, 'content-type': ct },
+      body: JSON.stringify({ identifier: OWNER.email, password: OWNER.password }),
+    });
+    assert.equal(r.status, 401, ct);
+  }
+  assert.equal(count(env, 'SELECT COUNT(*) FROM sessions'), before, 'nobody was signed in');
+});
+
 await run();

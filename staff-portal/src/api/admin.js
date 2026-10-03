@@ -13,11 +13,11 @@
 // reverters.js. (The import cycle with reverters.js is safe: both sides only
 // use the other's function declarations at call time.)
 
-import { json, readJson, iso, now, toInt, str, strStrict, safeJsonParse, parseIsoStrict, DAY } from '../util.js';
+import { json, readJson, iso, now, toInt, str, strStrict, safeJsonParse, parseIsoStrict, MINUTE, DAY } from '../util.js';
 import { HttpError, GuardError, ValidationError, forbidden, notFound } from '../errors.js';
 import { PERMISSIONS, SYSTEM_ROLES, SUPER_RANK } from '../catalog.js';
 import {
-  can, effectivePermissions, assertCanActOn, assertCanAssignRole, validateRolePermissions, requireStepUp,
+  can, effectivePermissions, assertCanActOn, assertCanAssignRole, validateRolePermissions, requireStepUp, roleCarriesDanger,
 } from '../rbac.js';
 import { audit, auditError, listAudit, getAuditEntry, verifyChain } from '../audit.js';
 import { undoFor } from '../undo.js';
@@ -29,7 +29,7 @@ import {
 } from '../invitations.js';
 import { revokeSession, revokeUserSessions, findSessionByRef } from '../sessions.js';
 import { listDevices, setDeviceStatus, renameDevice, revokeDevice, deviceCode, deviceState, normalizeDeviceCode } from '../devices.js';
-import { streakConfig, streakStatus, getStreak, adjustStreak } from '../streak.js';
+import { streakConfig, streakStatus, getStreak, adjustStreak, STREAK_FIELDS } from '../streak.js';
 import { userFactors, resetFactors } from '../mfa/factors.js';
 import { listDestinations, addDestination, removeDestination, destinationHint } from '../mfa/otp.js';
 import { emailConfigured, sendEmail } from '../notify.js';
@@ -138,6 +138,26 @@ async function count(env, sql, ...args) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// The streak is decoration (SPEC §10.16, §16.38): a broken streaks table must
+// not take the admin overview or a person's panel — suspend, reset, sign out —
+// down with it. The read answers null and the real error goes to the audit
+// log, at most once per isolate per ten minutes (the log is never trimmed).
+const STREAK_ERROR_AUDIT_EVERY_MS = 10 * MINUTE;
+let lastStreakErrorAuditMs = -Infinity;
+
+async function streakOrNull(rc, read, target) {
+  try {
+    return await read();
+  } catch (e) {
+    console.error('[streak] read failed:', e && e.message);
+    if (rc.nowMs - lastStreakErrorAuditMs >= STREAK_ERROR_AUDIT_EVERY_MS || rc.nowMs < lastStreakErrorAuditMs) {
+      lastStreakErrorAuditMs = rc.nowMs;
+      await auditError(rc, 'streak.error', e, { target, detail: 'Could not read the streak; the page was served without it.' });
+    }
+    return null;
+  }
+}
+
 // Only the counts this caller may see (CONTRACTS §8.4).
 async function overview(rc) {
   requireAny(rc, ADMIN_CONSOLE_PERMS);
@@ -176,8 +196,10 @@ async function overview(rc) {
   }
   if (can(a, 'streaks.view_all')) {
     const cfg = streakConfig(rc.policy);
-    const { results } = await env.DB.prepare("SELECT s.* FROM streaks s JOIN users u ON u.id = s.user_id WHERE u.status = 'active'").all();
-    counts.streaks_active = results.filter((r) => streakStatus(r, t, cfg).current > 0).length;
+    counts.streaks_active = await streakOrNull(rc, async () => {
+      const { results } = await env.DB.prepare("SELECT s.* FROM streaks s JOIN users u ON u.id = s.user_id WHERE u.status = 'active'").all();
+      return results.filter((r) => streakStatus(r, t, cfg).current > 0).length;
+    }, null);
   }
   const out = { counts };
   if (can(a, 'audit.view')) {
@@ -247,7 +269,7 @@ async function getPerson(rc, params) {
   const row = await getUser(env, params.id);
   if (!row || (!all && row.manager_id !== rc.user.id)) throw notFound('No such person.');
   const cfg = streakConfig(rc.policy);
-  const streak = cfg.enabled ? await getStreak(env, row.id, t, cfg) : null;
+  const streak = cfg.enabled ? await streakOrNull(rc, () => getStreak(env, row.id, t, cfg), userTarget(row.id)) : null;
   const user = await userView(env, row, t, { withLocked: all });
   if (!all) return json(200, { user, streak, scope: 'team' });
   const authz = await effectivePermissions(env, row, t);
@@ -284,10 +306,29 @@ async function defaultRoleId(env, given) {
   return r ? r.id : null;
 }
 
+// Minting an account hands out its role. Giving an existing person a role
+// that carries a danger permission takes users.roles and a fresh step-up, so
+// creating a person with one — an invitation, an approved access request, or
+// a new link for someone still invited — takes the step-up too (SPEC §5.5,
+// §7.9); otherwise a stale session mints a Super Admin. A role that does not
+// exist is left to createUser to refuse.
+async function requireStepUpToMint(rc, roleId, invitee = null) {
+  const rid = toInt(roleId, 1);
+  if (!Number.isFinite(rid)) return;
+  const role = await rc.env.DB.prepare('SELECT id, key, rank, permissions, is_system FROM roles WHERE id = ?').bind(rid).first();
+  if (!role || !roleCarriesDanger(role)) return;
+  // Someone who may not hand this out at all is told that, not "confirm it's you".
+  const actor = await actorAuthz(rc);
+  if (invitee) assertCanActOn(actor, await effectivePermissions(rc.env, invitee, rc.nowMs));
+  else assertCanAssignRole(actor, role);
+  requireStepUp(rc);
+}
+
 async function invite(rc) {
   const b = await body(rc);
   const roleId = await defaultRoleId(rc.env, b.role_id);
   return writing(rc, 'user.invite', null, async () => {
+    await requireStepUpToMint(rc, roleId);
     const user = await createUser(rc, {
       email: b.email,
       full_name: b.full_name,
@@ -531,6 +572,8 @@ async function deleteDestination(rc, params) {
 
 async function reissue(rc, params) {
   return writing(rc, 'invitation.reissue', userTarget(String(params.id)), async () => {
+    const invitee = await getUser(rc.env, params.id);
+    if (invitee) await requireStepUpToMint(rc, invitee.role_id, invitee);
     const inv = await reissueInvitation(rc, params.id);
     const row = await getUser(rc.env, params.id);
     const emailed = await emailInvitation(rc, row.email, row.full_name, inv);
@@ -555,7 +598,9 @@ async function postStreak(rc, params) {
       detail: `Set ${user.email}’s streak to ${row.current} (longest ${row.longest}): ${reason}`,
       before: prior ? { current: prior.current, longest: prior.longest } : null,
       after: { current: row.current, longest: row.longest },
-      undo: undoFor('streak', { userId: user.id, prior }),
+      // `wrote`: what this adjustment left, so a revert can tell whether the
+      // person has signed in since (and refuse rather than wipe those days).
+      undo: undoFor('streak', { userId: user.id, prior, wrote: Object.fromEntries(STREAK_FIELDS.map((k) => [k, row[k] ?? null])) }),
     });
     return json(200, { ok: true, streak: streakStatus(row, rc.nowMs, cfg) });
   });
@@ -584,6 +629,7 @@ async function approveRequest(rc, params) {
   const b = await body(rc);
   const roleId = await defaultRoleId(rc.env, b.role_id);
   return writing(rc, 'request.approve', { type: 'access_request', id: str(params.id, 20) }, async () => {
+    await requireStepUpToMint(rc, roleId);
     const { user, invitation } = await approveAccessRequest(rc, params.id, { role_id: roleId });
     const emailed = await emailInvitation(rc, user.email, user.full_name, invitation);
     await audit(rc, {
@@ -850,10 +896,13 @@ async function deleteRoleDef(rc, params) {
 
 // ---------------------------------------------------------------- devices
 
-function deviceView(d) {
+// The code is what approves a waiting device (POST /api/me/devices/approve
+// takes it from anyone with an approved device and a step-up), so only a
+// caller who may approve devices sees it — never a read-only role (§16.19).
+function deviceView(d, showCode) {
   return {
     id: d.id,
-    code: d.code ?? null,
+    code: showCode ? d.code ?? null : null,
     status: deviceState(d),
     label: d.label ?? null,
     ua: d.ua ?? null,
@@ -872,7 +921,8 @@ function deviceView(d) {
 async function getDevices(rc) {
   const s = rc.url.searchParams.get('status');
   const rows = await listDevices(rc.env, { status: s === null || s === '' ? undefined : s, limit: 500 });
-  return json(200, { devices: rows.map(deviceView) });
+  const showCode = can(rc.authz, 'devices.approve');
+  return json(200, { devices: rows.map((d) => deviceView(d, showCode)) });
 }
 
 function deviceTarget(id) {
@@ -901,6 +951,12 @@ function deviceStatusRoute(kind) {
       if (kind === 'unblock') {
         const cur = await rc.env.DB.prepare('SELECT status FROM devices WHERE id = ?').bind(str(params.id, 128)).first();
         if (cur && cur.status !== 'blocked') throw new HttpError(409, { error: 'That device isn’t blocked.', code: 'not_blocked' });
+      }
+      // devices.approve approves WAITING devices. Lifting a block is
+      // devices.manage's (…/unblock), so approve never reaches past one.
+      if (kind === 'approve') {
+        const cur = await rc.env.DB.prepare('SELECT status FROM devices WHERE id = ?').bind(str(params.id, 128)).first();
+        if (cur && cur.status !== 'pending') throw new HttpError(409, { error: 'That device isn’t waiting for approval.', code: 'not_pending' });
       }
       const { prior, row } = await setDeviceStatus(rc, params.id, d.status, {});
       await audit(rc, {
@@ -1070,6 +1126,9 @@ async function postRevert(rc, params) {
       target,
       severity: 'notice',
       detail: `Reverted entry #${entry.seq} (${entry.action}): ${out.detail}`,
+      // What the revert overwrote and what it left, when the reverter says.
+      before: out.before,
+      after: out.after,
       revertsId: entry.id,
     });
     return json(200, { ok: true, reverted: entry.id, revert_id: row ? row.id : null, detail: out.detail, notices: out.notices ?? [], warnings: out.warnings ?? [] });

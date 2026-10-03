@@ -820,8 +820,8 @@ Shell path sets (GET unless noted). Every shell also allows `/healthz`,
 |---|---|---|---|
 | setup | `/`, `/setup` | `/js/setup.js` | `GET /api/setup/status`, `POST /api/setup` |
 | request | `/`, `/request-access` | `/js/request.js`, `/js/fp.js` | `POST /api/access-request`, `POST /api/fp` |
-| login | `/`, `/login` | `/js/login.js`, `/js/fp.js`, `/js/webauthn.js` | `POST /api/fp`, `GET /api/auth/whoami`, `POST /api/auth/login` (answers `403 { fingerprint_required: true }` until a fingerprint is on file), `POST /api/auth/mfa/*` |
-| invite | `/invite` | `/js/invite.js`, `/js/fp.js` | `GET /api/invite/:token`, `POST /api/invite/lookup`, `POST /api/invite/accept`, `POST /api/fp` |
+| login | `/`, `/login`, `/invite` | `/js/login.js`, `/js/fp.js`, `/js/webauthn.js`, `/js/invite.js` | `POST /api/fp`, `GET /api/auth/whoami`, `POST /api/auth/login` (answers `403 { fingerprint_required: true }` until a fingerprint is on file), `POST /api/auth/mfa/*`, `POST /api/invite/lookup`, `POST /api/invite/accept` — an invitation link works in `fingerprint_gate` without a pass |
+| invite | `/invite` | `/js/invite.js`, `/js/fp.js` | `POST /api/invite/lookup`, `POST /api/invite/accept`, `POST /api/fp` |
 | pending | any navigation shows `/pending` | `/js/pending.js` | `GET /api/device/status`, `GET /api/diag` |
 
 ### 7.9 signin.js
@@ -911,11 +911,10 @@ direct requests for `*.html` paths are 404.
 |---|---|---|
 | GET /api/setup/status | none | → `{ needed: bool, org_name }` (setup shell only) |
 | POST /api/setup | none | `{ setup_key, email, full_name, password }` → completeSignIn response. Key compared in constant time; setup_ip limit; one-shot claim row in `meta` that **expires after 10 minutes** (B trap 3); creates the Super Admin (`users.createOwner`), allowlists the caller's IP as tier 1 (`/32` or `/128`) — **skipped with a notice when the address is private/reserved** (e.g. `wrangler dev` reports loopback), since the approved device is then the way back in — approves the device, signs in pinned to `mfa_enroll`. Afterwards the route is unreachable. |
-| GET /api/invite/:token | none | → `{ email, full_name, org_name, expires_at }` or 404; invite_ip limit. A request whose `Sec-Fetch-Site` is present and not `same-origin` (an `<img>` on another site) gets the same 404 and is not charged, so cross-site loads cannot spend a shared office address's bucket |
-| POST /api/invite/lookup | none | `{ token }` → the same as `GET /api/invite/:token` (invite_ip limit). The token travels in the body, so no URL — and no proxy, history or path log — ever holds it; the page should use this, and the GET goes once it does |
+| POST /api/invite/lookup | none | `{ token }` → `{ email, full_name, org_name, expires_at, privacy_notice }` or 404; invite_ip limit. The token travels in the body, so no URL — no proxy, edge log, history or path log — ever holds it, and as a POST it must come from our own origin, so a cross-site `<img>` cannot spend a shared office address's bucket. There is no GET lookup |
 | POST /api/invite/accept | none | `{ token, password, full_name? }` → completeSignIn response |
 | POST /api/access-request | none | `{ email, full_name, reason }` → `{ ok: true }` (identical whether or not the email is known) |
-| POST /api/fp | none | `{ signals }` → `{ ok: true }`; sets fp cookie |
+| POST /api/fp | none | `{ signals }` → `{ ok: true, privacy_notice: string \| null }`; sets fp cookie. `privacy_notice` is how the request page (whose shell has no other source) honours the setting: text → show it, null → hide it |
 | GET /api/diag | none | → `{ cookies: { names, count }, ua, client_hints, ip, country, asn, tls_version, http_protocol, device: { present, status, code }, session: { present, valid } }` — names only, never values (A §5) |
 | GET /api/device/status | none | → `{ code, status, label }`; mints a pending device if none |
 
@@ -984,6 +983,7 @@ cannot reach the step-up routes), needs only the session.
 | POST /api/admin/users/:id/revoke-devices | users.suspend |
 | GET/POST /api/admin/users/:id/destinations · DELETE …/destinations/:did | destinations.manage (reserved) |
 | POST /api/admin/users/:id/invitation | users.invite — reissue (rank guard on the invitee; **+ step-up** when their role carries a danger permission) |
+| GET /api/admin/users/:id/streak | streaks.view_all (anyone) or team.view (direct reports; others 404) — `?days=7..400` (default 84) → `{ user, enabled, status, history, since, rules }`; `since` is the day they joined in the portal zone. The console's on-demand day log |
 | POST /api/admin/users/:id/streak | streaks.manage — `{ current, longest, reason }` |
 | GET /api/admin/invitations · POST /api/admin/invitations/:id/revoke | users.invite |
 | GET /api/admin/requests · POST …/:id/approve `{ role_id }` · POST …/:id/deny | requests.manage (approve: **+ step-up** when `role_id` carries a danger permission, as for an invitation) |

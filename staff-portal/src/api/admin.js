@@ -29,7 +29,8 @@ import {
 } from '../invitations.js';
 import { revokeSession, revokeUserSessions, findSessionByRef } from '../sessions.js';
 import { listDevices, setDeviceStatus, renameDevice, revokeDevice, deviceCode, deviceState, normalizeDeviceCode } from '../devices.js';
-import { streakConfig, streakStatus, getStreak, adjustStreak, STREAK_FIELDS } from '../streak.js';
+import { streakConfig, streakStatus, getStreak, streakHistory, streakRules, adjustStreak, STREAK_FIELDS } from '../streak.js';
+import { localDay, dayString } from '../calendar/protected.js';
 import { userFactors, resetFactors } from '../mfa/factors.js';
 import { listDestinations, addDestination, removeDestination, destinationHint } from '../mfa/otp.js';
 import { emailConfigured, sendEmail } from '../notify.js';
@@ -1076,6 +1077,31 @@ async function getStreaks(rc) {
   return json(200, { streaks, scope: all ? 'all' : 'team', enabled: cfg.enabled });
 }
 
+// One person's day log, for the administrator who has to answer "why did my
+// streak reset?" before restoring it (SPEC §10.18): which days counted, which
+// were protected, which were missed. Same scope as the list above.
+async function getPersonStreak(rc, params) {
+  requireAny(rc, ['streaks.view_all', 'team.view']);
+  const all = can(rc.authz, 'streaks.view_all');
+  const row = await getUser(rc.env, params.id);
+  if (!row || (!all && row.manager_id !== rc.user.id)) throw notFound('No such person.');
+  const cfg = streakConfig(rc.policy);
+  const n = toInt(rc.url.searchParams.get('days'), 7, 400);
+  const days = Number.isFinite(n) ? n : 84;
+  const target = userTarget(row.id);
+  const status = await streakOrNull(rc, () => getStreak(rc.env, row.id, rc.nowMs, cfg), target);
+  const history = status === null ? null : await streakOrNull(rc, () => streakHistory(rc.env, row.id, rc.nowMs, cfg, days), target);
+  const created = parseIsoStrict(row.created_at);
+  return json(200, {
+    user: { id: row.id, full_name: row.full_name, email: row.email },
+    enabled: cfg.enabled,
+    status,
+    history,
+    since: Number.isFinite(created) ? dayString(localDay(created, cfg.tz)) : null,
+    rules: streakRules(cfg),
+  });
+}
+
 // ---------------------------------------------------------------- audit
 
 function revertibleKinds() {
@@ -1169,6 +1195,7 @@ export function register(router) {
   router.add('POST', '/api/admin/users/:id/destinations', postDestination, { perm: 'destinations.manage' });
   router.add('DELETE', '/api/admin/users/:id/destinations/:did', deleteDestination, { perm: 'destinations.manage' });
   router.add('POST', '/api/admin/users/:id/invitation', reissue, { perm: 'users.invite' });
+  router.add('GET', '/api/admin/users/:id/streak', getPersonStreak, any(['streaks.view_all', 'team.view']));
   router.add('POST', '/api/admin/users/:id/streak', postStreak, { perm: 'streaks.manage' });
 
   router.add('GET', '/api/admin/invitations', getInvitations, { perm: 'users.invite' });

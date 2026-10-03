@@ -22,6 +22,8 @@ const el = {
   reasonCount: $('reason-count'),
   error: $('request-error'),
   submit: $('request-submit'),
+  privacy: $('privacy'),
+  privacyText: $('privacy-text'),
 };
 
 const FIELDS = { full_name: el.name, email: el.email, reason: el.reason };
@@ -73,5 +75,10 @@ function updateCount() {
 el.form.addEventListener('submit', onSubmit);
 el.reason.addEventListener('input', updateCount);
 updateCount();
-// Never awaited: the form works whether or not the report gets through.
-reportFingerprint();
+// Never awaited: the form works whether or not the report gets through. The
+// markup carries the default notice; the reply names the real setting — text
+// replaces it, null (turned off) hides it.
+reportFingerprint().then((r) => {
+  if (typeof r?.privacy_notice === 'string' && r.privacy_notice.trim()) el.privacyText.textContent = r.privacy_notice.trim();
+  else if (r && r.privacy_notice === null) el.privacy.hidden = true;
+});

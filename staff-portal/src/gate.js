@@ -47,11 +47,13 @@ const SHELLS = Object.freeze({
     ...COMMON, 'GET /', 'GET /login', 'GET /js/login.js', 'GET /js/fp.js', 'GET /js/webauthn.js',
     'POST /api/fp', 'GET /api/auth/whoami', 'POST /api/auth/login', 'POST /api/auth/mfa/code',
     'POST /api/auth/mfa/send', 'POST /api/auth/mfa/otp', 'POST /api/auth/mfa/passkey/options', 'POST /api/auth/mfa/passkey/verify',
+    // An invitation link must work in fingerprint_gate too; the token in the
+    // body is the authority, and the page reports a fingerprint like login.
+    'GET /invite', 'GET /js/invite.js', 'POST /api/invite/lookup', 'POST /api/invite/accept',
   ]),
   invite: new Set([...COMMON, 'GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'POST /api/invite/lookup', 'POST /api/invite/accept', 'POST /api/fp']),
   pending: new Set([...COMMON, 'GET /pending', 'GET /js/pending.js', 'GET /api/device/status', 'GET /api/diag']),
 });
-const INVITE_LOOKUP = /^\/api\/invite\/[A-Za-z0-9_-]{1,256}$/;
 
 export const DECOY_404 =
   '<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>';
@@ -70,8 +72,7 @@ export function shellAllows(shell, method, path) {
   if (typeof shell !== 'string' || !Object.hasOwn(SHELLS, shell)) return false;
   if (typeof method !== 'string' || typeof path !== 'string' || path.length > 512) return false;
   const m = method.toUpperCase() === 'HEAD' ? 'GET' : method.toUpperCase();
-  if (SHELLS[shell].has(`${m} ${path}`)) return true;
-  return shell === 'invite' && m === 'GET' && INVITE_LOOKUP.test(path);
+  return SHELLS[shell].has(`${m} ${path}`);
 }
 
 // Zero-information either way (D2). The decoy imitates a stock server page

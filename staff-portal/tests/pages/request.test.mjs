@@ -95,4 +95,20 @@ test('the form works even when the fingerprint report fails', async () => {
   page.dispose();
 });
 
+test('the privacy notice follows the setting carried by the fingerprint reply', async () => {
+  const custom = await loadPage('request.html', { url: 'https://staff.example.com/request-access', fetch: { 'POST /api/fp': reply(200, { ok: true, privacy_notice: 'Custom words.' }) } });
+  await custom.drain();
+  assert.equal(custom.text('privacy-text'), 'Custom words.');
+  assert.ok(custom.visible('privacy'));
+  custom.dispose();
+  const off = await loadPage('request.html', { url: 'https://staff.example.com/request-access', fetch: { 'POST /api/fp': reply(200, { ok: true, privacy_notice: null }) } });
+  await off.drain();
+  assert.ok(!off.visible('privacy'), 'turned off → hidden');
+  off.dispose();
+  const failed = await loadPage('request.html', { url: 'https://staff.example.com/request-access', fetch: { 'POST /api/fp': reply(500, {}) } });
+  await failed.drain();
+  assert.ok(failed.visible('privacy'), 'no answer → the default stays (say so rather than go quiet)');
+  failed.dispose();
+});
+
 await run();

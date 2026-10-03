@@ -3669,3 +3669,29 @@ th[aria-sort="none"] .sort-btn .icon {
     animation: none !important;
   }
 }
+
+/* Admin › person › Streak: the day log, oldest first, one wrapping row of the
+   same cells the dashboard strip uses. */
+.daylog-wrap {
+  margin-top: 12px;
+}
+
+.daylog {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 6px;
+}
+
+.daylog .strip-day {
+  width: 14px;
+  height: 14px;
+  aspect-ratio: auto;
+  border-radius: 3px;
+}
+
+.daylog-summary {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}

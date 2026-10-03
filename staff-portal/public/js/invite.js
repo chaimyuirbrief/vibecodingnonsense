@@ -1,6 +1,6 @@
 // invite.js — accept an invitation (CONTRACTS §8.4 Public; D11).
 //
-// Reads ?token=, looks it up (GET /api/invite/:token → { email, full_name,
+// Reads ?token=, looks it up (POST /api/invite/lookup { token } → { email, full_name,
 // org_name, expires_at }) and, only if it is valid, shows the form. Accepting
 // (POST /api/invite/accept { token, password, full_name }) signs the person
 // in and approves this browser; we go to response.next or '/'. An invalid or
@@ -101,7 +101,9 @@ async function init() {
   state.token = token;
   let info;
   try {
-    info = await api('GET', `/api/invite/${encodeURIComponent(token)}`);
+    // In the body, never a path: no URL anywhere — proxy, edge log, history —
+    // ever holds the token (SPEC §13.6).
+    info = await api('POST', '/api/invite/lookup', { token });
   } catch (err) {
     if (err instanceof ApiError && (err.status === 404 || err.status === 410)) invalid();
     else invalid(`We couldn’t check this invitation. ${errorMessage(err)}`);

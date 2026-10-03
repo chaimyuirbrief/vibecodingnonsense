@@ -404,8 +404,9 @@ test('shellAllows: exactly the CONTRACTS §7.8 table', () => {
       'GET /', 'GET /login', 'GET /js/login.js', 'GET /js/fp.js', 'GET /js/webauthn.js', 'POST /api/fp', 'GET /api/auth/whoami',
       'POST /api/auth/login', 'POST /api/auth/mfa/code', 'POST /api/auth/mfa/send', 'POST /api/auth/mfa/otp',
       'POST /api/auth/mfa/passkey/options', 'POST /api/auth/mfa/passkey/verify',
+      'GET /invite', 'GET /js/invite.js', 'POST /api/invite/lookup', 'POST /api/invite/accept',
     ],
-    invite: ['GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'GET /api/invite/Abc_-123xyz', 'POST /api/invite/lookup', 'POST /api/invite/accept', 'POST /api/fp'],
+    invite: ['GET /invite', 'GET /js/invite.js', 'GET /js/fp.js', 'POST /api/invite/lookup', 'POST /api/invite/accept', 'POST /api/fp'],
     pending: ['GET /pending', 'GET /js/pending.js', 'GET /api/device/status', 'GET /api/diag'],
   };
   const everything = new Set(Object.values(table).flat());
@@ -428,6 +429,7 @@ test('shellAllows: exactly the CONTRACTS §7.8 table', () => {
     }
   }
   assert.equal(G.shellAllows('setup', 'HEAD', '/setup'), true);
+  assert.equal(G.shellAllows('invite', 'GET', '/api/invite/Abc_-123xyz'), false, 'the token never travels in a path');
   assert.equal(G.shellAllows('invite', 'GET', '/api/invite/a/b'), false);
   assert.equal(G.shellAllows('invite', 'POST', '/api/invite/abc'), false);
   assert.equal(G.shellAllows('invite', 'GET', '/api/invite/'), false);

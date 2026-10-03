@@ -416,7 +416,7 @@ leave one out and the page silently fails to load it.
 |---|---|---|---|
 | `setup` | no accounts exist | `/`, `/setup` | setup status, `POST /api/setup` |
 | `request` | `request_access`, untrusted | `/`, `/request-access` | `POST /api/access-request`, `POST /api/fp` |
-| `login` | `fingerprint_gate`, no valid fingerprint yet | `/`, `/login` | `POST /api/fp`, `GET /api/auth/whoami`, and the sign-in POSTs — the login API itself answers `403 { fingerprint_required }` until a fingerprint is on file |
+| `login` | `fingerprint_gate`, no valid fingerprint yet | `/`, `/login`, `/invite` | `POST /api/fp`, `GET /api/auth/whoami`, and the sign-in POSTs — the login API itself answers `403 { fingerprint_required }` until a fingerprint is on file — plus the invitation lookup and accept, so an invitation link is never a dead end in this mode |
 | `invite` | a valid invitation pass cookie | `/invite` | invitation lookup and accept, `POST /api/fp` |
 | `pending` | device gating with an unapproved device, or `invite_only` on an allowlisted address with an unapproved device | any navigation shows `/pending` | device status, `GET /api/diag` |
 
@@ -2218,7 +2218,10 @@ nothing.
 
 Managers see their reports' streaks (`team.view`); auditors and administrators
 see everyone's (`streaks.view_all`). The day log behind the history strip is
-the evidence for "why did my streak reset?"
+the evidence for "why did my streak reset?" — so the person card shows it on
+demand (`GET /api/admin/users/:id/streak`, same scope): every day of the last
+twelve weeks as counted, protected or missed, with the days before they joined
+drawn as neither, and one sentence counting them.
 
 `streaks.manage` (a dangerous permission, so it needs a step-up) can set a
 person's current and longest counts, with a **reason**. The write is audited

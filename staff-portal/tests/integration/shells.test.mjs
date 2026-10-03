@@ -36,7 +36,8 @@ test('invite: a stranger opens the real link, sets a password, is signed in and 
   assert.equal(page.served.file, 'invite.html');
   assert.deepEqual(Object.keys(page.served.assets).sort(), ['/css/app.css', '/favicon.svg', '/js/common.js', '/js/fp.js', '/js/invite.js']);
   await settle(page);
-  const info = calls(page, 'GET', `/api/invite/${token}`)[0];
+  const info = calls(page, 'POST', '/api/invite/lookup')[0];
+  assert.deepEqual(info.body, { token });
   assert.equal(info.status, 200, JSON.stringify(info.response));
   assert.ok(page.visible('pane-form'));
   assert.equal(page.text('invite-email'), info.response.email);
@@ -68,11 +69,11 @@ test('invite: a used or bogus link says so plainly (shown to a visitor the gate 
   const office = client(env, { ip: OWNER_IP });
   const page = await openLive(office, `/invite?token=${'A'.repeat(43)}`);
   await settle(page);
-  assert.equal(calls(page, 'GET', `/api/invite/${'A'.repeat(43)}`)[0].status, 404);
+  assert.equal(calls(page, 'POST', '/api/invite/lookup')[0].status, 404);
   assert.ok(page.visible('pane-invalid'));
   assert.ok(!page.visible('pane-form'));
   assert.equal(page.text('title'), 'Invitation not valid');
-  noFailures(page, ['GET /api/invite/']);
+  noFailures(page, ['POST /api/invite/lookup']);
   // A stranger with a dead link gets nothing at all (no pass cookie).
   const stranger = client(env);
   assert.equal((await navigate(stranger, `/invite?token=${'A'.repeat(43)}`)).status, 403);

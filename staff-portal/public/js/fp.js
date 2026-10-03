@@ -390,7 +390,9 @@ export async function collectSignals({ deadlineMs = 1500 } = {}) {
   return signals;
 }
 
-// POST /api/fp { signals } → { ok }. Never throws, never blocks the page.
+// POST /api/fp { signals } → { ok, privacy_notice? }. Never throws, never
+// blocks the page. privacy_notice is passed through only when the reply names
+// it: a string (show it) or null (the setting is off).
 export async function reportFingerprint({ deadlineMs = 1500 } = {}) {
   try {
     const signals = await collectSignals({ deadlineMs });
@@ -401,7 +403,16 @@ export async function reportFingerprint({ deadlineMs = 1500 } = {}) {
       cache: 'no-store',
       body: JSON.stringify({ signals }),
     });
-    return { ok: !!(res && res.ok) };
+    const out = { ok: !!(res && res.ok) };
+    if (out.ok) {
+      try {
+        const body = await res.json();
+        if (body && (typeof body.privacy_notice === 'string' || body.privacy_notice === null)) out.privacy_notice = body.privacy_notice;
+      } catch {
+        /* a reply without JSON still counts as reported */
+      }
+    }
+    return out;
   } catch {
     return { ok: false };
   }

@@ -219,6 +219,16 @@ test('Manager: overview, their own people, invitations and streaks — all load'
   assert.ok(streakCard, 'their streak, from the team view');
   assert.match(streakCard.textContent, new RegExp(`Current${detail.response.streak.current} days?`));
   assert.deepEqual(page.$('person-detail').querySelectorAll('[data-write]').map((b) => b.textContent.trim()), [], 'nothing a manager may change here');
+  // The day log, loaded on demand from the real route (SPEC §10.18).
+  await page.click('daylog-show');
+  await settle(page);
+  const log = calls(page, 'GET', new RegExp(`^/api/admin/users/${w.employee.user.id}/streak`))[0];
+  assert.match(log.url, /\?days=84$/);
+  assert.equal(log.status, 200, JSON.stringify(log.response));
+  assert.equal(log.response.history.length, 84);
+  assert.equal(page.$('person-detail').querySelectorAll('.daylog .strip-day').length, 84);
+  assert.ok(page.$('person-detail').querySelectorAll('.daylog .strip-day.is-before').length > 0, 'days before they joined are not missed');
+  assert.match(page.$('person-detail').querySelector('.daylog-summary').textContent, /^Signed in on \d+ of \d+ open days?; \d+ protected days? didn’t count against them\.$/);
   const titles = page.$('person-detail').querySelectorAll('section.card .card-title').map((t) => t.textContent);
   assert.ok(!titles.includes('Access'), 'no permissions table built from data the team view does not carry');
   assert.ok(!/No temporary roles/.test(page.text('person-detail')));

@@ -6,7 +6,7 @@ import { DEFAULT_PRIVACY_NOTICE } from '../../src/policy.js';
 
 const ORIGIN = 'https://staff.example.com';
 const TOKEN = 'abc.DEF_ghi-123';
-// The real GET /api/invite/:token reply (src/api/public.js invitationInfo), notice included.
+// The real POST /api/invite/lookup reply (src/api/public.js describeInvitation), notice included.
 const INFO = { email: 'sam@acme.com', full_name: 'Sam Example', org_name: 'Acme Inc.', expires_at: '2026-10-09T12:00:00.000Z', privacy_notice: DEFAULT_PRIVACY_NOTICE };
 const DONE = { ok: true, user: { id: 2 }, pinned: null, enroll_prompt: true, next: '/', streak: null };
 
@@ -15,7 +15,7 @@ async function open({ token = TOKEN, fetch = {} } = {}) {
   return loadPage('invite.html', {
     url,
     fetch: {
-      [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: reply(200, INFO),
+      'POST /api/invite/lookup': reply(200, INFO),
       'POST /api/fp': reply(200, { ok: true }),
       'GET /api/auth/whoami': reply(200, { authenticated: true }),
       ...fetch,
@@ -36,16 +36,19 @@ test('a valid link shows who it is for, prefills the name, and reports a fingerp
   assert.equal(page.$('full_name').value, 'Sam Example');
   assert.equal(page.document.activeElement, page.$('password'));
   assert.equal(page.requests('/api/fp').length, 1);
-  assert.equal(page.requests('/api/invite/')[0].url, `/api/invite/${encodeURIComponent(TOKEN)}`);
+  const lookup = page.requests('/api/invite/lookup')[0];
+  assert.equal(lookup.method, 'POST');
+  assert.deepEqual(lookup.body, { token: TOKEN });
+  assert.ok(!page.requests('').some((r) => r.url.includes(TOKEN) || r.url.includes(encodeURIComponent(TOKEN))), 'the token is in no request URL');
   assert.ok(page.visible('privacy'), 'the default notice shows');
   assert.deepEqual(page.calls.unmatched, []);
   page.dispose();
 });
 
-test('the token is URL-encoded into the lookup path', async () => {
+test('the token travels in the body, exactly as the link carried it', async () => {
   const weird = 'a/b?c=d#e';
-  const page = await open({ token: weird, fetch: { [`GET /api/invite/${encodeURIComponent(weird)}`]: reply(200, INFO) } });
-  assert.equal(page.requests('/api/invite/')[0].path, `/api/invite/${encodeURIComponent(weird)}`);
+  const page = await open({ token: weird });
+  assert.deepEqual(page.requests('/api/invite/lookup')[0].body, { token: weird });
   assert.ok(page.visible('pane-form'));
   page.dispose();
 });
@@ -61,7 +64,7 @@ test('no token → a clear message, no form, no lookup', async () => {
 
 test('invalid or expired → a clear message and NO form', async () => {
   for (const r of [reply(404, { error: 'Not found.' }), reply(410, { error: 'Expired.' })]) {
-    const page = await open({ fetch: { [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: r } });
+    const page = await open({ fetch: { 'POST /api/invite/lookup': r } });
     assert.ok(page.visible('pane-invalid'));
     assert.ok(!page.visible('pane-form'));
     assert.match(page.text('pane-invalid'), /expired, been used already, or been replaced/);
@@ -71,7 +74,7 @@ test('invalid or expired → a clear message and NO form', async () => {
 });
 
 test('lookup rate-limited → still no form, and the reason is readable', async () => {
-  const page = await open({ fetch: { [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: reply(429, { retry_after: 600 }) } });
+  const page = await open({ fetch: { 'POST /api/invite/lookup': reply(429, { retry_after: 600 }) } });
   assert.ok(!page.visible('pane-form'));
   assert.match(page.text('invalid-detail'), /Try again in 10 minutes/);
   page.dispose();
@@ -145,16 +148,16 @@ test('cookie refused after accepting → explained, no loop', async () => {
 });
 
 test('privacy notice follows the response when it names one', async () => {
-  const on = await open({ fetch: { [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: reply(200, { ...INFO, privacy_notice: 'Custom notice.' }) } });
+  const on = await open({ fetch: { 'POST /api/invite/lookup': reply(200, { ...INFO, privacy_notice: 'Custom notice.' }) } });
   assert.equal(on.text('privacy-text'), 'Custom notice.');
   on.dispose();
-  const off = await open({ fetch: { [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: reply(200, { ...INFO, privacy_notice: null }) } });
+  const off = await open({ fetch: { 'POST /api/invite/lookup': reply(200, { ...INFO, privacy_notice: null }) } });
   assert.ok(!off.visible('privacy'));
   off.dispose();
 });
 
 test('a hostile name or email is shown as text, never parsed', async () => {
-  const page = await open({ fetch: { [`GET /api/invite/${encodeURIComponent(TOKEN)}`]: reply(200, { ...INFO, email: '<img src=x onerror=alert(1)>@x.y', org_name: '<b>Org</b>' }) } });
+  const page = await open({ fetch: { 'POST /api/invite/lookup': reply(200, { ...INFO, email: '<img src=x onerror=alert(1)>@x.y', org_name: '<b>Org</b>' }) } });
   assert.equal(page.text('invite-email'), '<img src=x onerror=alert(1)>@x.y');
   assert.equal(page.$('invite-email').children.length, 0);
   assert.equal(page.text('invite-org'), '<b>Org</b>');

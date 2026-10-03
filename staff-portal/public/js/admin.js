@@ -993,7 +993,75 @@ function streakCard(st, user, base, area) {
       });
     });
   }
-  return card('Streak', can('streaks.manage') ? 'Restore one after an outage, a clock problem or a closure longer than the leeway. A Super Admin can revert it.' : null, facts, form);
+  return card('Streak', can('streaks.manage') ? 'Restore one after an outage, a clock problem or a closure longer than the leeway. A Super Admin can revert it.' : null, facts, dayLog(base), form);
+}
+
+// The day log: which days counted, which were protected, which were missed —
+// what an administrator needs before restoring a streak (SPEC §10.18).
+// Loaded on demand so opening a person costs one request, not two.
+function dayLog(base) {
+  const out = h('div', { class: 'daylog-wrap' });
+  const show = h('button', { type: 'button', class: 'btn btn-ghost btn-sm', id: 'daylog-show' }, 'Show the last 12 weeks');
+  out.append(show);
+  show.addEventListener('click', () =>
+    busy(show, async () => {
+      let r;
+      try {
+        r = await api('GET', `${base}/streak?days=84`);
+      } catch (err) {
+        out.replaceChildren(h('p', { class: 'muted' }, `Couldn’t load the day log. ${errorMessage(err)}`));
+        return;
+      }
+      out.replaceChildren(...renderDayLog(r));
+    }),
+  );
+  return out;
+}
+
+export function renderDayLog(r) {
+  const history = Array.isArray(r?.history) ? r.history : null;
+  if (!history) return [h('p', { class: 'muted' }, 'No day log: the streak could not be read.')];
+  const since = typeof r.since === 'string' ? r.since : null;
+  let counted = 0;
+  let open = 0;
+  let rest = 0;
+  const cells = history.map((d) => {
+    const day = typeof d?.day === 'string' ? d.day : '';
+    const before = since !== null && day < since;
+    const cls = ['strip-day'];
+    let what;
+    if (before) {
+      cls.push('is-before');
+      what = 'before they joined';
+    } else if (d.counted) {
+      cls.push('is-counted');
+      what = d.protected ? `signed in (${(d.names || []).join(', ') || 'protected'})` : 'signed in';
+    } else if (d.protected) {
+      cls.push('is-protected');
+      what = `protected (${(d.names || []).join(', ') || 'closed'})`;
+    } else if (d.today) {
+      what = 'today, not yet';
+    } else {
+      cls.push('is-missed');
+      what = 'missed';
+    }
+    if (d.today) cls.push('is-today');
+    // Open days are the ones that could have been missed: not before they
+    // joined, not protected, and not today unless today already counted.
+    if (!before) {
+      if (d.protected) rest++;
+      else if (d.counted || !d.today) {
+        open++;
+        if (d.counted) counted++;
+      }
+    }
+    const label = `${day ? dayLabel(day) : '?'}: ${what}`;
+    return h('span', { class: cls.join(' '), title: label, 'aria-label': label, role: 'img' });
+  });
+  return [
+    h('p', { class: 'daylog-summary' }, `Signed in on ${counted} of ${plural(open, 'open day')}; ${plural(rest, 'protected day')} didn’t count against them.`),
+    h('div', { class: 'daylog', role: 'group', 'aria-label': 'Day log, oldest first' }, cells),
+  ];
 }
 
 // --------------------------------------------- invitations and requests ----

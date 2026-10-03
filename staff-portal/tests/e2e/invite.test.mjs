@@ -46,7 +46,7 @@ test('a valid link sets the pass and opens the invite shell — and nothing more
   assert.match(page.headers.get('set-cookie'), /__Host-pass=.*Max-Age=900/);
   assert.equal((await s.get('/invite')).status, 200, 'the pass now opens /invite');
   for (const p of ['/js/invite.js', '/js/fp.js', '/js/common.js', '/css/app.css']) assert.equal((await s.get(p)).status, 200, p);
-  const info = await s.get(`/api/invite/${inv.token}`);
+  const info = await s.post('/api/invite/lookup', { token: inv.token });
   assert.equal(info.status, 200);
   assert.deepEqual(Object.keys(info.body).sort(), ['email', 'expires_at', 'full_name', 'org_name', 'privacy_notice']);
   assert.equal(info.body.email, 'ivan@acme.com');
@@ -119,10 +119,24 @@ test('in request_access mode a link shows the invitation, not the request form',
   assert.equal((await s.post('/api/invite/accept', { token: inv.token, password: PASSWORD })).status, 200);
 });
 
-test('in fingerprint_gate a link changes nothing, so no pass is handed out', async () => {
-  const { env, inv } = await world();
+test('in fingerprint_gate a link opens the invitation inside the login shell — no pass, and accepting works', async () => {
+  const { env, inv, ivan } = await world();
   setSetting(env, 'access_mode', 'fingerprint_gate');
-  nothing(await client(env).get(`/invite?token=${inv.token}`), 'fingerprint_gate');
+  const s = client(env);
+  const page = await s.get(`/invite?token=${inv.token}`);
+  assert.equal(page.status, 200, 'the link is not a dead end');
+  assert.equal(page.text, await pageText('invite.html'));
+  assert.ok(!s.jar.has(PASS_COOKIE), 'fingerprint_gate never hands out a pass');
+  for (const p of ['/js/invite.js', '/js/fp.js', '/js/common.js', '/css/app.css']) assert.equal((await s.get(p)).status, 200, p);
+  assert.equal((await s.post('/api/invite/lookup', { token: inv.token })).status, 200);
+  const accept = await s.post('/api/invite/accept', { token: inv.token, password: PASSWORD, full_name: 'Ivan Invitee' });
+  assert.equal(accept.status, 200, accept.text);
+  assert.equal(q(env, 'SELECT status FROM users WHERE id = ?', ivan.id)[0].status, 'active');
+  assert.equal((await s.get('/')).text, await pageText('dashboard.html'), 'the accepted device is approved, so the gate lets it in');
+  // Without a fingerprint, the shell still refuses everything else.
+  const stranger = client(env);
+  assert.equal((await stranger.get('/api/me')).status, 403);
+  assert.equal((await stranger.get('/admin')).status, 403);
 });
 
 test('link lookups are limited per address, and a flood stops writing', async () => {
@@ -147,11 +161,13 @@ test('a refused or failed lookup leaves the token in no log an Auditor can read'
   // Refused at the gate: the pass did not come back (a cookie-blocking
   // webview, a pass that expired, the address changed mid-load).
   home.jar.delete(PASS_COOKIE);
-  nothing(await home.get(`/api/invite/${token}`), 'lookup without the pass');
+  // A token in a path — a mistyped or forwarded link — is refused (there is
+  // no GET lookup) and still recorded only in redacted form.
+  nothing(await home.get(`/api/invite/${token}`), 'a token in a path');
   // Failed in the handler: a transient database error during the lookup.
   assert.equal((await home.get(`/invite?token=${token}`)).status, 200);
   env.DB.failOn = /FROM invitations WHERE token_hash/;
-  const failed = await home.get(`/api/invite/${token}`);
+  const failed = await home.post('/api/invite/lookup', { token });
   env.DB.failOn = null;
   assert.equal(failed.status, 500);
 
@@ -159,7 +175,7 @@ test('a refused or failed lookup leaves the token in no log an Auditor can read'
   assert.ok(visits.includes('/api/invite/:token'), 'the refusal is still recorded, without its token');
   assert.ok(!visits.some((p) => p.includes(token)), 'no token in visits');
   const audit = JSON.stringify(auditRows(env));
-  assert.match(audit, /Unexpected failure on GET \/api\/invite\/:token/);
+  assert.match(audit, /Unexpected failure on POST \/api\/invite\/lookup/);
   assert.ok(!audit.includes(token), 'no token in the audit log');
   const seen = await auditor.client.get('/api/admin/visits?limit=500');
   assert.equal(seen.status, 200, seen.text);
@@ -172,7 +188,7 @@ test('a refused or failed lookup leaves the token in no log an Auditor can read'
 
 // The lookup with the token in the body: no URL ever holds it, and as a POST
 // it must come from our own origin.
-test('POST /api/invite/lookup answers like the GET, inside the invite shell, with no token in any path', async () => {
+test('POST /api/invite/lookup answers inside the invite shell, with no token in any path', async () => {
   const { env, inv } = await world();
   const s = client(env);
   assert.equal((await s.get(`/invite?token=${inv.token}`)).status, 200);
@@ -188,26 +204,28 @@ test('POST /api/invite/lookup answers like the GET, inside the invite shell, wit
   nothing(await client(env).post('/api/invite/lookup', { token: inv.token }), 'no pass');
 });
 
-// Cross-site GETs pass the worker's same-origin check, so an <img> pointing
-// at the lookup on any page a browser behind the office address opens would
-// spend that address's invite_ip bucket and stop new hires there accepting.
-test('cross-site loads of the lookup are refused uncharged; a new hire on that address still gets in', async () => {
+// The token never travels in a path, so a cross-site <img> pointed at a
+// lookup URL is just a refused request: no route, nothing charged, and a new
+// hire behind that office address still gets in.
+test('cross-site loads cannot spend the invite bucket; a new hire on that address still gets in', async () => {
   const { env, inv } = await world();
   for (let i = 0; i < 25; i++) {
     const r = await rawRequest(env, 'GET', `/api/invite/junk${i}`, {
       ip: OWNER_IP,
       headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'no-cors', 'sec-fetch-dest': 'image' },
     });
-    assert.equal(r.status, 404);
+    assert.ok(r.status === 404 || r.status === 403, `refused (${r.status})`);
   }
-  // A real token, loaded cross-site, says nothing either.
   const leak = await rawRequest(env, 'GET', `/api/invite/${inv.token}`, { ip: OWNER_IP, headers: { 'sec-fetch-site': 'cross-site' } });
-  assert.equal(leak.status, 404);
+  assert.ok(leak.status === 404 || leak.status === 403);
+  // A cross-site POST is refused by the origin check before any handler.
+  const xpost = await rawRequest(env, 'POST', '/api/invite/lookup', { ip: OWNER_IP, headers: { origin: 'https://evil.example', 'content-type': 'application/json' }, body: JSON.stringify({ token: inv.token }) });
+  assert.equal(xpost.status, 403);
   assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'invite_ip'"), 0, 'nothing was charged');
 
   const hire = new Client(worker, env, { ip: OWNER_IP });
   assert.equal((await hire.get(`/invite?token=${inv.token}`)).status, 200);
-  const lookup = await hire.get(`/api/invite/${inv.token}`, { 'sec-fetch-site': 'same-origin' });
+  const lookup = await hire.post('/api/invite/lookup', { token: inv.token });
   assert.equal(lookup.status, 200, lookup.text);
   assert.equal(lookup.body.email, 'ivan@acme.com');
   const accept = await hire.post('/api/invite/accept', { token: inv.token, password: PASSWORD, full_name: 'Ivan Invitee' });

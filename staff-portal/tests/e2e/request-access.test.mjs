@@ -117,4 +117,19 @@ test('a stranger hammering a refused route adds no rate-limit rows past the limi
   assert.equal(count(env, "SELECT COUNT(*) FROM auth_attempts WHERE kind = 'request_ip'"), 5);
 });
 
+test('the fingerprint reply tells the request page which privacy notice to show (B §6 "Say so")', async () => {
+  const env = await world();
+  const signals = { signals: { v: 1, tz: 'America/New_York', languages: ['en-US'] } };
+  const on = await client(env).post('/api/fp', signals);
+  assert.equal(on.status, 200);
+  assert.equal(on.body.ok, true);
+  assert.equal(typeof on.body.privacy_notice, 'string');
+  assert.ok(on.body.privacy_notice.length > 20);
+  setSetting(env, 'privacy_notice_text', 'We record your browser details to keep accounts safe.');
+  assert.equal((await client(env).post('/api/fp', signals)).body.privacy_notice, 'We record your browser details to keep accounts safe.');
+  setSetting(env, 'privacy_notice', '0');
+  const off = await client(env).post('/api/fp', signals);
+  assert.equal(off.body.privacy_notice, null, 'turned off → null, so the page hides it');
+});
+
 await run();

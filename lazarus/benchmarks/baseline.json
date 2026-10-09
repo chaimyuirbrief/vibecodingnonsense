@@ -1,0 +1,33 @@
+{
+  "python": "3.13.16",
+  "sqlite": "3.45.1",
+  "machine": "x86_64",
+  "pipeline": [
+    {
+      "n": 1000,
+      "import_rows_per_s": 5152,
+      "enroll_per_s": 30902,
+      "plan_per_s": 2810,
+      "dispatch_per_s": 1574,
+      "inbound_per_s": 922,
+      "sent": 739,
+      "db_mb": 4.7
+    },
+    {
+      "n": 10000,
+      "import_rows_per_s": 3990,
+      "enroll_per_s": 34909,
+      "plan_per_s": 2179,
+      "dispatch_per_s": 324,
+      "inbound_per_s": 381,
+      "sent": 7468,
+      "db_mb": 34.5
+    }
+  ],
+  "classifier": {
+    "messages": 6540,
+    "per_s": 2061,
+    "p50_us": 444,
+    "p99_us": 1407
+  }
+}

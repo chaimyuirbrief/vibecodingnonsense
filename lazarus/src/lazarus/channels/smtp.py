@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import smtplib
+import ssl
 from collections.abc import Callable
 from email.message import EmailMessage
 from email.utils import formatdate
@@ -56,7 +57,7 @@ class SMTPEmail:
         stage = "handshake"
         try:
             if self.starttls:
-                client.starttls()
+                client.starttls(context=ssl.create_default_context())  # verify cert + hostname
             if self.username and self.password:
                 client.login(self.username, self.password)
             stage = "data"

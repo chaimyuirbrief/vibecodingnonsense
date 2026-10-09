@@ -138,7 +138,9 @@ def test_ambiguous_lost_is_requeued_after_lookup(store: Store, campaign: Campaig
     e.enroll("test")
     e.tick()
     ch.plan = FaultPlan()
-    e.tick(clock.advance(timedelta(minutes=1)))  # reconcile: provider never got it -> requeue
+    e.tick(clock.advance(timedelta(minutes=1)))  # within the resend grace: not yet requeued
+    assert statuses(store) == ["unknown"]
+    e.tick(clock.advance(timedelta(minutes=16)))  # past grace: provider never got it -> requeue
     e.tick(clock.advance(timedelta(minutes=1)))
     assert len(ch.deliveries) == 1 and statuses(store) == ["sent"]
 
@@ -193,6 +195,8 @@ def test_suppression_checked_at_send_time(store: Store, engine: Engine, channel:
     store.suppress("+14045552368", "manual", "test")  # e.g. imported DNC list between plan and send
     engine.dispatch()
     assert channel.deliveries == [] and statuses(store) == ["canceled"]
+    state = store.conn.execute("SELECT state FROM enrollments").fetchone()["state"]
+    assert state == "blocked"  # not stranded in awaiting_send
 
 
 def test_optout_confirmation_sent_once(store: Store, channel: FakeChannel, clock: FakeClock) -> None:
@@ -410,3 +414,29 @@ def test_schema_newer_than_code_is_refused(tmp_path: Any, clock: FakeClock) -> N
 def test_message_status_enum_coverage() -> None:
     assert {s.value for s in MessageStatus} >= {"queued", "sending", "sent", "unknown", "held"}
     assert EnrollmentState.HANDED_OFF.value == "handed_off"
+
+
+def test_daily_cap_enforced_at_claim_across_workers(tmp_path: Any, clock: FakeClock) -> None:
+    st = Store(tmp_path / "cap.db", clock)
+    st.save_campaign(make_campaign(id="cap", daily_send_cap=25))
+    for i in range(100):
+        add_lead(st, phone=f"+1404557{i:04d}")
+    ch = FakeChannel("sms", clock=clock.now)
+    engines = [Engine(st if i == 0 else st.clone(), {"sms": ch}, worker_id=f"w{i}") for i in range(4)]
+    engines[0].enroll("cap")
+    engines[0].plan()
+    assert st.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 25  # planning stops at capacity
+    st.save_campaign(make_campaign(id="cap", daily_send_cap=10))  # operator lowers the cap after planning
+    threads = [threading.Thread(target=e.dispatch, kwargs={"limit": 10}) for e in engines]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for e in engines:
+        e.dispatch()
+    assert len(ch.deliveries) == 10  # exact at the claim, despite 4 concurrent claimers
+    clock.advance(timedelta(days=1))
+    for _ in range(3):
+        engines[0].tick()
+    assert len(ch.deliveries) == 20
+    assert replay(st).ok

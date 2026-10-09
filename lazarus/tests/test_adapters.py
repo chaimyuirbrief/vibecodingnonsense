@@ -77,7 +77,8 @@ class FakeSMTP:
         self.sent: list[EmailMessage] = []
         FakeSMTP.instances.append(self)
 
-    def starttls(self) -> None:
+    def starttls(self, context: Any = None) -> None:
+        assert context is not None and context.verify_mode.name == "CERT_REQUIRED" and context.check_hostname
         if FakeSMTP.mode == "drop_handshake":
             raise smtplib.SMTPServerDisconnected("bye")
 

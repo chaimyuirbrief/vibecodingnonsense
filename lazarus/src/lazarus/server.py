@@ -13,6 +13,7 @@ signature checks disabled.
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import urllib.parse
@@ -51,18 +52,30 @@ class RateLimiter:
 def make_server(engine_factory: Callable[[], Engine], host: str = "127.0.0.1", port: int = 8787,
                 public_url: str | None = None, twilio_auth_token: str | None = None,
                 inbound_secret: str | None = None, limiter: RateLimiter | None = None) -> ThreadingHTTPServer:
-    local = threading.local()
     lim = limiter or RateLimiter()
+    # ThreadingHTTPServer runs each request on a new thread, so a thread-local engine would be rebuilt per
+    # request (new connection, and a fresh LLM budget each time). A small pool reuses engines; callers
+    # should share one budgeted LLM provider across the engines the factory builds.
+    pool: queue.LifoQueue[Engine] = queue.LifoQueue(maxsize=16)
 
-    def engine() -> Engine:
-        if not hasattr(local, "engine"):
-            local.engine = engine_factory()  # one SQLite connection per handler thread
-        e: Engine = local.engine
-        return e
+    class _Lease:
+        def __enter__(self) -> Engine:
+            try:
+                self.e = pool.get_nowait()
+            except queue.Empty:
+                self.e = engine_factory()
+            return self.e
+
+        def __exit__(self, *exc: object) -> None:
+            try:
+                pool.put_nowait(self.e)
+            except queue.Full:
+                self.e.store.close()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "lazarus"
         sys_version = ""
+        timeout = 15  # seconds per socket read: stalled (slowloris) connections are dropped
 
         def log_message(self, format: str, *args: Any) -> None:
             pass  # no request logging by default: bodies and numbers are PII
@@ -77,14 +90,20 @@ def make_server(engine_factory: Callable[[], Engine], host: str = "127.0.0.1", p
         def _json(self, code: int, obj: dict[str, Any]) -> None:
             self._send(code, json.dumps(obj).encode())
 
+        def _reject(self) -> None:
+            if not lim.allow(self.client_address[0]):  # charge failed authentication only
+                return self._json(429, {"error": "rate_limited"})
+            return self._json(403, {"error": "bad_signature"})
+
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 return self._json(200, {"ok": True})
             return self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            if not lim.allow(self.client_address[0]):
-                return self._json(429, {"error": "rate_limited"})
+            # Rate limiting applies only to requests that FAIL authentication (see _reject): signature checks
+            # are cheap, and refusing a valid provider webhook because junk drained a shared bucket (all
+            # traffic arrives from the proxy's IP) would drop real opt-outs.
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -112,18 +131,19 @@ def make_server(engine_factory: Callable[[], Engine], host: str = "127.0.0.1", p
                 return self._json(400, {"error": "bad_encoding"})
             url = public_url.rstrip("/") + self.path
             if not verify_twilio_signature(twilio_auth_token, url, form, self.headers.get("X-Twilio-Signature")):
-                return self._json(403, {"error": "bad_signature"})
+                return self._reject()
             frm, body, sid = form.get("From"), form.get("Body", ""), form.get("MessageSid")
             if not frm or not sid:
                 return self._json(400, {"error": "missing_fields"})
-            engine().handle_inbound("sms", frm, body, provider_id=sid)
+            with _Lease() as eng:
+                eng.handle_inbound("sms", frm, body, provider_id=sid)
             return self._send(200, TWIML_EMPTY, "text/xml")
 
         def _generic(self, raw: bytes) -> None:
             if not inbound_secret:
                 return self._json(503, {"error": "inbound_not_configured"})
             if not verify(inbound_secret, raw, self.headers.get("X-Lazarus-Signature")):
-                return self._json(403, {"error": "bad_signature"})
+                return self._reject()
             try:
                 data = json.loads(raw)
                 channel, frm, body, pid = data["channel"], data["from"], data["body"], data["id"]
@@ -131,7 +151,24 @@ def make_server(engine_factory: Callable[[], Engine], host: str = "127.0.0.1", p
                 return self._json(400, {"error": "bad_payload"})
             if channel not in ("sms", "email") or not all(isinstance(x, str) for x in (frm, body, pid)):
                 return self._json(400, {"error": "bad_payload"})
-            res = engine().handle_inbound(channel, frm, body, provider_id=f"generic:{pid}")
+            with _Lease() as eng:
+                res = eng.handle_inbound(channel, frm, body, provider_id=f"generic:{pid}")
             return self._json(200, {"label": res["label"], "duplicate": res["duplicate"]})
 
-    return ThreadingHTTPServer((host, port), Handler)
+    class BoundedServer(ThreadingHTTPServer):
+        daemon_threads = True
+        _slots = threading.BoundedSemaphore(64)
+
+        def process_request(self, request: Any, client_address: Any) -> None:
+            if not self._slots.acquire(blocking=False):  # too many concurrent connections
+                self.shutdown_request(request)
+                return
+            super().process_request(request, client_address)
+
+        def process_request_thread(self, request: Any, client_address: Any) -> None:
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._slots.release()
+
+    return BoundedServer((host, port), Handler)

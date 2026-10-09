@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -136,12 +136,28 @@ def test_paused_campaign(store: Store, campaign: Campaign, clock: FakeClock) -> 
 def test_daily_cap(store: Store, clock: FakeClock) -> None:
     c = make_campaign(id="capped", daily_send_cap=1)
     store.save_campaign(c)
-    a, b = add_lead(store, phone="+14045551111"), add_lead(store, phone="+14045552222")
-    now = ts(clock.now())
-    store.conn.execute(
-        """INSERT INTO messages (id, kind, lead_id, campaign_id, channel, to_addr, body, composed_by, status, idempotency_key,
-           created_at, updated_at, sent_at) VALUES ('m1','outreach',?, 'capped','sms','+14045551111','x','template','sent','k1',?,?,?)""",
-        (a, now, now, now))
+    b = add_lead(store, phone="+14045552222")
+    from lazarus.policy import day_key
+    store.conn.execute("INSERT INTO send_counters (campaign_id, day, n) VALUES ('capped', ?, 1)", (day_key(c, clock.now()),))
     lead_b = store.get_lead(b)
     assert lead_b
-    assert check_send(store, lead_b, c, "sms", clock.now()).reason == "daily_cap"
+    d = check_send(store, lead_b, c, "sms", clock.now())
+    assert d.reason == "daily_cap" and d.retry_at and d.retry_at > clock.now()
+
+
+def test_send_margin_closes_window_early(store: Store, campaign: Campaign, clock: FakeClock) -> None:
+    lid = add_lead(store)
+    lead = store.get_lead(lid)
+    assert lead
+    clock.set(datetime(2026, 10, 12, 23, 57, tzinfo=UTC))  # 19:57 New York: inside 9-20, but < 5 min left
+    d = check_send(store, lead, campaign, "sms", clock.now())
+    assert d.reason == "quiet_hours" and d.retry_at == datetime(2026, 10, 13, 13, 0, tzinfo=UTC)
+
+
+def test_lead_under_review_blocks_all_campaigns(store: Store, campaign: Campaign, clock: FakeClock) -> None:
+    lid = add_lead(store)
+    lead = store.get_lead(lid)
+    assert lead
+    store.conn.execute("INSERT INTO inbound (id, channel, from_addr, body, received_at, lead_id, needs_review) "
+                       "VALUES ('i1','sms','+14045552368','hm', ?, ?, 1)", (ts(clock.now()), lid))
+    assert check_send(store, lead, campaign, "sms", clock.now()).reason == "lead_under_review"

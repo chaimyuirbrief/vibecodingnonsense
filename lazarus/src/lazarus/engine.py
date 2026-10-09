@@ -13,6 +13,7 @@ is not.
 from __future__ import annotations
 
 import json
+import random
 import threading
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -22,7 +23,7 @@ from typing import Any
 
 from .channels import Channel, Outbound, SendResult
 from .classify import Classification, classify
-from .compose import compose, finalize
+from .compose import TemplateRejected, compose, finalize
 from .llm import LLMProvider
 from .models import (
     OPEN_MESSAGE,
@@ -33,10 +34,10 @@ from .models import (
     Lead,
     MessageStatus,
 )
-from .normalize import normalize_email, normalize_phone
-from .policy import address_for, check_send, static_checks
+from .normalize import normalize_sender
+from .policy import address_for, business_day_start, check_send, daily_used, day_key, lead_zones, static_checks
 from .store import Store
-from .timeutil import parse_ts, ts
+from .timeutil import next_allowed, parse_ts, ts
 
 S = EnrollmentState
 M = MessageStatus
@@ -51,6 +52,8 @@ class EngineConfig:
     backoff_max_s: int = 6 * 3600
     optout_confirmation_window_s: int = 300
     outbox_max_attempts: int = 12
+    # Must exceed the worst-case duration of one provider call (Twilio adapter: 15 s, SMTP: 20 s timeouts).
+    resend_grace_s: int = 900
 
 
 Sink = Callable[[str, dict[str, Any]], None]  # (kind, payload) -> raises on failure
@@ -67,6 +70,7 @@ class Engine:
         self.sink = sink
         self._campaigns: dict[str, Campaign] = {}
         self._lock = threading.Lock()
+        self._rng = random.Random(worker_id)
 
     # ------------------------------------------------------------------ helpers
 
@@ -132,12 +136,22 @@ class Engine:
 
     # ------------------------------------------------------------------ plan
 
+    def _approved_count(self, campaign: Campaign) -> int:
+        if not campaign.approve_first_n:
+            return 0
+        (n,) = self.store.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE campaign_id=? AND kind='outreach' AND approved_by IS NOT NULL LIMIT ?)",
+            (campaign.id, campaign.approve_first_n)).fetchone()
+        return int(n)
+
     def _needs_approval(self, campaign: Campaign, composed_by: str) -> bool:
         if composed_by == "llm" and campaign.approve_llm_messages:
             return True
         if campaign.approve_first_n:
+            # Until a human has approved N messages of this campaign, every new one waits for approval.
+            # (Counting drafts instead would let message N+1 go out while the first N sit unreviewed.)
             (n,) = self.store.conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE campaign_id=? AND kind='outreach' AND status NOT IN ('canceled')",
+                "SELECT COUNT(*) FROM messages WHERE campaign_id=? AND kind='outreach' AND approved_by IS NOT NULL",
                 (campaign.id,),
             ).fetchone()
             return bool(n < campaign.approve_first_n)
@@ -145,17 +159,44 @@ class Engine:
 
     def plan(self, now: datetime | None = None) -> Counter[str]:
         now = now or self.now()
+        self.invalidate_campaign_cache()
         out: Counter[str] = Counter()
         rows = self.store.conn.execute(
             """SELECT e.* FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
-               WHERE e.state=? AND e.next_due_at<=? AND c.status='active' ORDER BY e.next_due_at LIMIT ?""",
+               WHERE e.state=? AND e.next_due_at<=? AND c.status='active'
+               AND NOT EXISTS (SELECT 1 FROM inbound i WHERE i.lead_id=e.lead_id AND i.needs_review=1 AND i.resolved_at IS NULL)
+               ORDER BY e.next_due_at LIMIT ?""",
             (S.ACTIVE.value, ts(now), self.cfg.plan_batch),
         ).fetchall()
+        room: dict[str, int] = {}
+        approved: dict[str, int] = {}
         for e in rows:
             campaign = self.campaign(e["campaign_id"])
             lead = self.store.get_lead(e["lead_id"])
             assert lead is not None
             step_index = e["step_index"]
+            if step_index < len(campaign.steps):
+                # Don't queue more than today's remaining capacity: a backlog beyond the daily cap stays as
+                # due enrollments instead of becoming messages that are re-deferred every day.
+                if campaign.id not in room:
+                    (open_n,) = self.store.conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE campaign_id=? AND kind='outreach' AND status IN ('queued','pending_approval','held')",
+                        (campaign.id,)).fetchone()
+                    room[campaign.id] = campaign.daily_send_cap - daily_used(self.store, campaign, now) - int(open_n)
+                if room[campaign.id] <= 0:
+                    out["held_back:daily_capacity"] += 1
+                    continue
+                # Claim the enrollment for planning so concurrent workers don't each compose (and pay an LLM
+                # for) the same step.
+                with self.store.tx():
+                    got = self.store.conn.execute(
+                        "UPDATE enrollments SET plan_lease_until=? WHERE id=? AND state=? AND step_index=? "
+                        "AND (plan_lease_until IS NULL OR plan_lease_until<?)",
+                        (ts(now + timedelta(seconds=self.cfg.lease_seconds)), e["id"], S.ACTIVE.value, step_index, ts(now)),
+                    ).rowcount
+                if not got:
+                    out["skipped_taken"] += 1
+                    continue
             if step_index >= len(campaign.steps):
                 self._cas_enrollment(e["id"], {S.ACTIVE}, step_index, S.EXHAUSTED, "sequence_complete")
                 out["exhausted"] += 1
@@ -170,15 +211,24 @@ class Engine:
                 "SELECT 1 FROM messages WHERE enrollment_id=? AND channel=? AND status IN ('sent','unknown') LIMIT 1",
                 (e["id"], step.channel),
             ).fetchone()
-            composed = compose(step, lead, campaign, is_first=is_first, llm=self.llm)  # may call LLM: outside tx
+            try:
+                composed = compose(step, lead, campaign, is_first=is_first, llm=self.llm)  # may call LLM: outside tx
+            except TemplateRejected as ex:
+                self._cas_enrollment(e["id"], {S.ACTIVE}, step_index, S.BLOCKED, "template_rejected", outcome=str(ex)[:200])
+                out["blocked:template_rejected"] += 1
+                continue
             body, subject = finalize(composed, step, campaign, is_first=is_first)
-            status = M.PENDING_APPROVAL if self._needs_approval(campaign, composed.composed_by) else M.QUEUED
+            if campaign.id not in approved:
+                approved[campaign.id] = self._approved_count(campaign)
+            needs = (composed.composed_by == "llm" and campaign.approve_llm_messages) or approved[campaign.id] < campaign.approve_first_n
+            status = M.PENDING_APPROVAL if needs else M.QUEUED
             addr = address_for(lead, step.channel)
             assert addr is not None
             with self.store.tx():
                 cur = self._enrollment(e["id"])
-                if cur["state"] != S.ACTIVE.value or cur["step_index"] != step_index:
-                    out["skipped_changed"] += 1  # an inbound reply changed it while we composed
+                if (cur["state"] != S.ACTIVE.value or cur["step_index"] != step_index
+                        or cur["next_due_at"] != e["next_due_at"]):
+                    out["skipped_changed"] += 1  # a reply (e.g. "later") changed it while we composed
                     continue
                 prior = [r["status"] for r in self.store.conn.execute(
                     "SELECT status FROM messages WHERE enrollment_id=? AND step_index=? AND kind='outreach'",
@@ -217,6 +267,7 @@ class Engine:
                 if composed.llm_error:
                     self.store.emit("message", mid, "compose.llm_error", {"error": composed.llm_error})
                 self.store.set_enrollment_state(e["id"], S.AWAITING_SEND, reason="planned")
+            room[campaign.id] = room.get(campaign.id, 1) - 1
             out[status.value] += 1
         return out
 
@@ -234,7 +285,7 @@ class Engine:
     # ------------------------------------------------------------------ approvals
 
     def approve(self, message_id: str, actor: str, body: str | None = None) -> bool:
-        fields: dict[str, Any] = {"next_attempt_at": ts(self.now())}
+        fields: dict[str, Any] = {"next_attempt_at": ts(self.now()), "approved_by": actor}
         if body is not None:
             fields["body"] = body
             fields["composed_by"] = "human"
@@ -253,99 +304,143 @@ class Engine:
     # ------------------------------------------------------------------ dispatch
 
     def dispatch(self, now: datetime | None = None, limit: int | None = None) -> Counter[str]:
-        now = now or self.now()
+        """Send due messages. Each message is checked, claimed, sent and recorded on its own, with a
+        fresh clock reading: quiet hours are judged at send time, not batch-start time, and a worker
+        that dies mid-batch strands at most the one message it was sending."""
+        start = now or self.now()
+        self.invalidate_campaign_cache()  # pick up campaign edits made by other processes
         out: Counter[str] = Counter()
-        claimed: list[Any] = []
-        with self.store.tx():
-            rows = self.store.conn.execute(
-                "SELECT * FROM messages WHERE status=? AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT ?",
-                (M.QUEUED.value, ts(now), limit or self.cfg.dispatch_batch),
-            ).fetchall()
-            for r in rows:
-                if self.store.set_message_status(
-                    r["id"], M.SENDING, reason="claimed", expect=frozenset({M.QUEUED}),
-                    attempts=r["attempts"] + 1, lease_owner=self.worker_id,
-                    lease_until=ts(now + timedelta(seconds=self.cfg.lease_seconds)),
-                ):
-                    claimed.append(r)
-        for r in claimed:
-            out[self._dispatch_one(r, now)] += 1
+        want = limit or self.cfg.dispatch_batch
+        ids = [r["id"] for r in self.store.conn.execute(
+            "SELECT id FROM messages WHERE status=? AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT ?",
+            (M.QUEUED.value, ts(start), want * 4))]
+        self._rng.shuffle(ids)  # concurrent workers start at different points instead of colliding on the head
+        done = 0
+        for mid in ids:
+            if done >= want:
+                break
+            res = self._dispatch_one(mid)
+            out[res] += 1
+            done += res != "skipped:taken"
         return out
 
-    def _dispatch_one(self, r: Any, now: datetime) -> str:
-        mid = r["id"]
-        if r["kind"] == "optout_confirmation":
+    def _requeue(self, mid: str, reason: str, at: datetime, owner: str | None = None) -> None:
+        expect = frozenset({M.SENDING}) if owner else frozenset({M.QUEUED})
+        self.store.set_message_status(mid, M.QUEUED, reason=reason, next_attempt_at=ts(at), lease_owner=None,
+                                      lease_until=None, expect=expect, owner=owner)
+
+    def _dispatch_one(self, mid: str) -> str:
+        now = self.now()  # read per message: quiet hours and sent_at reflect the actual send time
+        r = self.store.conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        if r is None or r["status"] != M.QUEUED.value:
+            return "skipped:taken"
+        channel = self.channels.get(r["channel"])
+        if channel is None:
+            self._requeue(mid, "deferred:no_channel", now + timedelta(hours=1))
+            return "deferred:no_channel"
+        outreach = r["kind"] == "outreach"
+        lead = self.store.get_lead(r["lead_id"]) if r["lead_id"] else None
+        campaign = self.campaign(r["campaign_id"]) if outreach else None
+        if not outreach:
             if now - parse_ts(r["created_at"]) > timedelta(seconds=self.cfg.optout_confirmation_window_s):
-                self.store.set_message_status(mid, M.CANCELED, reason="confirmation_window_passed")
+                self.store.set_message_status(mid, M.CANCELED, reason="confirmation_window_passed", expect=frozenset({M.QUEUED}))
                 return "canceled:confirmation_late"
         else:
-            lead = self.store.get_lead(r["lead_id"])
-            assert lead is not None
-            campaign = self.campaign(r["campaign_id"])
+            assert lead is not None and campaign is not None
             enr = self._enrollment(r["enrollment_id"])
             if enr["state"] != S.AWAITING_SEND.value:
-                self.store.set_message_status(mid, M.CANCELED, reason=f"enrollment_{enr['state']}")
+                self.store.set_message_status(mid, M.CANCELED, reason=f"enrollment_{enr['state']}", expect=frozenset({M.QUEUED}))
                 return "canceled:enrollment_changed"
-            d = check_send(self.store, lead, campaign, r["channel"], now, exclude_message_id=mid)
+            d = check_send(self.store, lead, campaign, r["channel"], now, exclude_message_id=mid, daily_cap=False)
             if not d.allowed:
                 if d.permanent:
                     with self.store.tx():
-                        self.store.set_message_status(mid, M.CANCELED, reason=d.reason)
-                        self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.BLOCKED, d.reason, outcome=d.reason)
+                        if self.store.set_message_status(mid, M.CANCELED, reason=d.reason, expect=frozenset({M.QUEUED})):
+                            self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.BLOCKED, d.reason, outcome=d.reason)
                     return f"blocked:{d.reason}"
-                self.store.set_message_status(mid, M.QUEUED, reason=f"deferred:{d.reason}", attempts=r["attempts"],
-                                              next_attempt_at=ts(d.retry_at or now), lease_owner=None, lease_until=None)
+                self._requeue(mid, f"deferred:{d.reason}", d.retry_at or now + timedelta(hours=1))
                 return f"deferred:{d.reason}"
-            # Last-moment suppression check: narrows the opt-out race to the provider call itself.
-            if self.store.is_suppressed(lead.phone, lead.email):
-                self.store.set_message_status(mid, M.CANCELED, reason="suppressed_at_send")
-                return "canceled:suppressed_at_send"
 
-        channel = self.channels.get(r["channel"])
-        if channel is None:
-            self.store.set_message_status(mid, M.QUEUED, reason="no_channel_configured", attempts=r["attempts"],
-                                          next_attempt_at=ts(now + timedelta(hours=1)), lease_owner=None, lease_until=None)
-            return "deferred:no_channel"
+        # Claim: daily counter + compare-and-set in one serialized transaction.
+        with self.store.tx():
+            if outreach:
+                assert campaign is not None and lead is not None
+                if daily_used(self.store, campaign, now) >= campaign.daily_send_cap:
+                    tomorrow = business_day_start(campaign, now) + timedelta(days=1)
+                    self._requeue(mid, "deferred:daily_cap", next_allowed(campaign.window, lead_zones(lead, campaign), tomorrow) or tomorrow)
+                    return "deferred:daily_cap"
+            if not self.store.set_message_status(
+                mid, M.SENDING, reason="claimed", expect=frozenset({M.QUEUED}), attempts=r["attempts"] + 1,
+                lease_owner=self.worker_id, lease_until=ts(now + timedelta(seconds=self.cfg.lease_seconds)),
+            ):
+                return "skipped:taken"
+            if outreach:
+                assert campaign is not None
+                self.store.conn.execute(
+                    "INSERT INTO send_counters (campaign_id, day, n) VALUES (?,?,1) "
+                    "ON CONFLICT(campaign_id, day) DO UPDATE SET n=n+1", (campaign.id, day_key(campaign, now)))
+
+        # Last-moment checks: narrow the opt-out race to the provider call itself.
+        if outreach and lead is not None:
+            reason = self.store.is_suppressed(lead.phone, lead.email)
+            if reason:
+                with self.store.tx():
+                    if self.store.set_message_status(mid, M.CANCELED, reason="suppressed_at_send", lease_owner=None,
+                                                     lease_until=None, expect=frozenset({M.SENDING}), owner=self.worker_id):
+                        self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.BLOCKED,
+                                             f"suppressed:{reason}", outcome=f"suppressed:{reason}")
+                return "canceled:suppressed_at_send"
+            if self.store.lead_under_review(lead.id):
+                self._requeue(mid, "deferred:lead_under_review", now + timedelta(hours=1), owner=self.worker_id)
+                return "deferred:lead_under_review"
         msg = Outbound(mid, r["idempotency_key"], r["channel"], r["to_addr"], r["body"], r["subject"])
         try:
             res = channel.send(msg)
         except Exception as e:  # noqa: BLE001 - an adapter bug must not become a resend
             res = SendResult("ambiguous", error=f"adapter exception: {type(e).__name__}: {e}")
-        return self._record_result(r, res, now)
+        claimed = dict(r)
+        claimed["attempts"] = r["attempts"] + 1
+        return self._record_result(claimed, res, self.now())
 
     def _record_result(self, r: Any, res: SendResult, now: datetime) -> str:
         mid = r["id"]
-        attempts = r["attempts"] + 1
+        attempts = r["attempts"]
+        me = self.worker_id
+        mine = frozenset({M.SENDING})
         with self.store.tx():
             if res.outcome == "sent":
-                self.store.set_message_status(mid, M.SENT, reason="sent", provider_id=res.provider_id,
-                                              sent_at=ts(now), lease_owner=None, lease_until=None,
-                                              expect=frozenset({M.SENDING, M.UNKNOWN}))
-                if r["enrollment_id"]:
+                ok = self.store.set_message_status(mid, M.SENT, reason="sent", provider_id=res.provider_id, sent_at=ts(now),
+                                                   lease_owner=None, lease_until=None, expect=mine, owner=me)
+                if not ok:
+                    # Our lease lapsed and a reconciler touched the row. A provider-confirmed send is the
+                    # truth: record it so it is never re-sent.
+                    ok = self.store.set_message_status(mid, M.SENT, reason="sent_after_lease_lapse", provider_id=res.provider_id,
+                                                       sent_at=ts(now), lease_owner=None, lease_until=None,
+                                                       expect=frozenset({M.SENDING, M.UNKNOWN, M.QUEUED}))
+                if ok and r["enrollment_id"]:
                     self._advance(r["enrollment_id"], r["step_index"], now)
-                return "sent"
+                return "sent" if ok else "lost_race"
             if res.outcome == "transient":
                 campaign_max = self.campaign(r["campaign_id"]).max_send_attempts if r["campaign_id"] else 3
                 if attempts >= campaign_max:
-                    self.store.set_message_status(mid, M.FAILED, reason="max_attempts", last_error=res.error,
-                                                  lease_owner=None, lease_until=None)
-                    if r["enrollment_id"]:
+                    if self.store.set_message_status(mid, M.FAILED, reason="max_attempts", last_error=res.error,
+                                                     lease_owner=None, lease_until=None, expect=mine, owner=me) and r["enrollment_id"]:
                         self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.FAILED, "max_attempts")
                     return "failed:max_attempts"
                 self.store.set_message_status(mid, M.QUEUED, reason="transient_error", last_error=res.error,
                                               next_attempt_at=ts(now + self._backoff(attempts, res.retry_after_s)),
-                                              lease_owner=None, lease_until=None)
+                                              lease_owner=None, lease_until=None, expect=mine, owner=me)
                 return "retry"
             if res.outcome == "permanent":
-                self.store.set_message_status(mid, M.FAILED, reason="permanent_error", last_error=res.error,
-                                              lease_owner=None, lease_until=None)
-                if res.suppress:
-                    self.store.suppress(r["to_addr"], "invalid_destination", source=f"provider:{r['channel']}")
-                if r["enrollment_id"]:
-                    self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.FAILED, "permanent_error")
+                if self.store.set_message_status(mid, M.FAILED, reason="permanent_error", last_error=res.error,
+                                                 lease_owner=None, lease_until=None, expect=mine, owner=me):
+                    if res.suppress:
+                        self.store.suppress(r["to_addr"], "invalid_destination", source=f"provider:{r['channel']}")
+                    if r["enrollment_id"]:
+                        self._cas_enrollment(r["enrollment_id"], {S.AWAITING_SEND}, None, S.FAILED, "permanent_error")
                 return "failed:permanent"
             self.store.set_message_status(mid, M.UNKNOWN, reason="ambiguous_outcome", last_error=res.error,
-                                          lease_owner=None, lease_until=None)
+                                          lease_owner=None, lease_until=None, expect=mine, owner=me)
             return "unknown"
 
     def _advance(self, eid: str, step_index: int, now: datetime) -> None:
@@ -382,7 +477,13 @@ class Engine:
                         self._advance(r["enrollment_id"], r["step_index"], now)
                 out["reconciled_sent"] += 1
             elif found is not None and found.outcome == "permanent":
-                # Provider definitively never received it: safe to send again.
+                # "Not found" only proves non-delivery once no request can still be in flight: the original
+                # worker may be mid-call (lookup sees nothing yet), so wait out a grace period longer than
+                # any adapter's worst-case request time before resending.
+                since = r["lease_until"] if r["status"] == M.SENDING.value else r["updated_at"]
+                if since and parse_ts(since) > now - timedelta(seconds=self.cfg.resend_grace_s):
+                    out["awaiting_grace"] += 1
+                    continue
                 self.store.set_message_status(r["id"], M.QUEUED, reason="reconciled_not_sent", next_attempt_at=ts(now),
                                               lease_owner=None, lease_until=None, expect=frozenset({M.SENDING, M.UNKNOWN}))
                 out["reconciled_requeued"] += 1
@@ -416,8 +517,8 @@ class Engine:
     def handle_inbound(self, channel: str, from_raw: str, body: str, provider_id: str | None = None,
                        received_at: datetime | None = None) -> dict[str, Any]:
         now = received_at or self.now()
-        addr = normalize_phone(from_raw) if channel == "sms" else normalize_email(from_raw)
-        addr = addr or from_raw.strip()[:320]
+        self.invalidate_campaign_cache()
+        addr = normalize_sender(channel, from_raw)
         if provider_id:
             prev = self.store.conn.execute("SELECT * FROM inbound WHERE provider_id=?", (provider_id,)).fetchone()
             if prev:
@@ -481,6 +582,11 @@ class Engine:
                     self.store.set_enrollment_state(e["id"], S.OPTED_OUT, reason="opt_out_reply", outcome="opt_out")
                 acts.append(f"canceled:{self._cancel_open(lead.id, 'opt_out')}")
                 self._queue_optout_confirmation(lead, addr, channel, now)
+            else:
+                # An opt-out we could not match to a lead: suppressed as received, and a human checks
+                # whether it belongs to a lead stored under a differently formatted address.
+                self._flag_review(iid)
+                acts.append("review:unmatched_opt_out")
             return acts
         if lead is None:
             if c.needs_review or label is not Label.AUTO_REPLY:
@@ -593,8 +699,10 @@ class Engine:
                                     (actor, ts(self.now()), label.value, inbound_id))
             self.store.emit("inbound", inbound_id, "inbound.resolved", {"label": label.value}, actor)
             if lead and label in (Label.AUTO_REPLY, Label.UNCLEAR):
+                if self.store.lead_under_review(lead.id):
+                    return ["still_under_review"]  # another flagged reply from this lead is unresolved
                 return self._resume_lead(lead.id, actor)
-            if lead:
+            if lead and not self.store.lead_under_review(lead.id):
                 # Release paused enrollments so normal routing can act on them.
                 for e in self._open_enrollments(lead.id):
                     if e["state"] == S.PAUSED.value:
@@ -648,10 +756,20 @@ class Engine:
         out: Counter[str] = Counter()
         if self.sink is None:
             return out
+        with self.store.tx():  # leases that lapsed (worker died mid-POST) go back to pending
+            self.store.conn.execute(
+                "UPDATE outbox SET status='pending' WHERE status='delivering' AND next_attempt_at<?", (ts(now),))
         rows = self.store.conn.execute(
             "SELECT * FROM outbox WHERE status='pending' AND next_attempt_at<=? ORDER BY created_at LIMIT ?",
             (ts(now), limit)).fetchall()
         for r in rows:
+            with self.store.tx():
+                claimed = self.store.conn.execute(
+                    "UPDATE outbox SET status='delivering', next_attempt_at=?, updated_at=? WHERE id=? AND status='pending'",
+                    (ts(now + timedelta(seconds=self.cfg.lease_seconds)), ts(now), r["id"])).rowcount
+            if not claimed:
+                out["skipped_taken"] += 1
+                continue
             try:
                 self.sink(r["kind"], json.loads(r["payload"]))
             except Exception as e:  # noqa: BLE001 - sink failures are retried
@@ -659,14 +777,14 @@ class Engine:
                 dead = attempts >= self.cfg.outbox_max_attempts
                 with self.store.tx():
                     self.store.conn.execute(
-                        "UPDATE outbox SET status=?, attempts=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
+                        "UPDATE outbox SET status=?, attempts=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=? AND status='delivering'",
                         ("dead" if dead else "pending", attempts, ts(now + self._backoff(attempts, None)),
                          f"{type(e).__name__}: {e}"[:300], ts(now), r["id"]))
                     self.store.emit("outbox", r["dedupe_key"], "outbox.dead" if dead else "outbox.retry", {"error": str(e)[:200]})
                 out["dead" if dead else "retry"] += 1
                 continue
             with self.store.tx():
-                self.store.conn.execute("UPDATE outbox SET status='delivered', attempts=attempts+1, updated_at=? WHERE id=?",
+                self.store.conn.execute("UPDATE outbox SET status='delivered', attempts=attempts+1, updated_at=? WHERE id=? AND status='delivering'",
                                         (ts(now), r["id"]))
                 self.store.emit("outbox", r["dedupe_key"], "outbox.delivered", {})
             out["delivered"] += 1

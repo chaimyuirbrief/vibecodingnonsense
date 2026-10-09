@@ -27,7 +27,7 @@ def test_simulation_passes_all_invariants() -> None:
     r = run(cfg())
     assert r.ok, r.to_json()
     assert r.metrics["deliveries"] > 100
-    assert r.metrics["worker_crashes"] >= 0 and r.metrics["duplicate_deliveries"] == 0
+    assert r.metrics.get("worker_crashes", 0) >= 0 and r.metrics["duplicate_deliveries"] == 0
 
 
 def test_simulation_is_deterministic() -> None:
@@ -101,3 +101,27 @@ def test_mutation_consent_ignored_is_caught(monkeypatch: pytest.MonkeyPatch) -> 
 def test_sim_campaign_is_valid() -> None:
     c = simulate.sim_campaign()
     assert len(c.steps) == 3 and c.send_optout_confirmation
+
+
+def test_mutation_stale_clock_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-introduce the red-team 'one now per tick' bug: judge every send by the batch-start time."""
+    orig = engine_mod.Engine.dispatch
+
+    def stale(self: Any, now: Any = None, limit: Any = None) -> Any:
+        frozen = now or self.now()
+        monkeypatch.setattr(self, "now", lambda: frozen)
+        try:
+            return orig(self, now, limit)
+        finally:
+            monkeypatch.delattr(self, "now")
+
+    monkeypatch.setattr(engine_mod.Engine, "dispatch", stale)
+    # First batch is judged at 19:45 New York and takes ~17 min of provider latency to send.
+    r = run(cfg(leads=300, days=2, send_latency_s=20.0, start="2026-10-12T23:30:00+00:00"))
+    assert r.violations.get("sent_in_quiet_hours")
+
+
+def test_latency_near_window_end_is_safe_with_fixed_engine() -> None:
+    """Same scenario as the mutation above, unmutated: per-message clock + 5-min margin keep it legal."""
+    r = run(cfg(leads=300, days=2, send_latency_s=20.0, start="2026-10-12T23:30:00+00:00"))
+    assert r.ok, r.to_json()

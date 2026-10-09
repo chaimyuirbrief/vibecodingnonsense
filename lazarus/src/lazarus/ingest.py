@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import itertools
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ from .normalize import (
     split_full_name,
 )
 from .store import Store
-from .timeutil import ts, zone
+from .timeutil import canonical_zone, ts
 
 ALIASES: dict[str, tuple[str, ...]] = {
     "external_id": ("id", "external_id", "contact_id", "lead_id", "record_id", "crm_id"),
@@ -37,6 +38,7 @@ ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 MAX_ROWS = 200_000
+CHUNK = 500
 MAX_FIELD = 5000
 
 
@@ -107,7 +109,20 @@ def import_csv(store: Store, text: str, source: str, default_country: str = "US"
         raise ValueError(f"no phone or email column found in headers {headers!r}")
 
     seen: dict[str, int] = {}
-    for i, raw in enumerate(reader, start=2):  # row 1 is the header
+    rows = enumerate(reader, start=2)  # row 1 is the header
+    while True:
+        # One transaction per chunk instead of per row (per-row commits dominated import time).
+        chunk = list(itertools.islice(rows, CHUNK))
+        if not chunk:
+            break
+        with store.tx():
+            _import_chunk(store, chunk, mapping, report, seen, source, default_country)
+    return report
+
+
+def _import_chunk(store: Store, chunk: list[tuple[int, dict[str | None, Any]]], mapping: dict[str, str],
+                  report: ImportReport, seen: dict[str, int], source: str, default_country: str) -> None:
+    for i, raw in chunk:
         if report.rows >= MAX_ROWS:
             raise ValueError(f"file exceeds {MAX_ROWS} rows; split it")
         report.rows += 1
@@ -140,7 +155,7 @@ def import_csv(store: Store, text: str, source: str, default_country: str = "US"
             warns.append("first name rejected (non-name characters)")
 
         tz_raw = get("timezone").strip()
-        tz = tz_raw if tz_raw and zone(tz_raw) else None
+        tz = canonical_zone(tz_raw)
         if tz_raw and not tz:
             warns.append(f"unknown timezone {tz_raw!r}; conservative fallback window will apply")
 
@@ -171,7 +186,6 @@ def import_csv(store: Store, text: str, source: str, default_country: str = "US"
             report.created += 1
         else:
             report.merged += 1
-    return report
 
 
 def upsert_lead(store: Store, rec: dict[str, Any], source: str) -> bool:
@@ -199,9 +213,17 @@ def upsert_lead(store: Store, rec: dict[str, Any], source: str) -> bool:
             )
             store.emit("lead", lead_id, "lead.created", {"source": source})
             return True
-        # If phone matches one lead and email another, merge into the oldest and leave the other
-        # untouched; the report surfaces it rather than silently fusing two people.
+        # If phone matches one lead and email another, merge fields into the oldest and leave the other's
+        # fields untouched rather than fusing two records — but a consent revocation applies to every
+        # record the row matched: the person said no, whichever record we texted them from.
         cur = sorted(rows, key=lambda r: r["created_at"])[0]
+        for other in rows:
+            if other["id"] == cur["id"]:
+                continue
+            for k in ("sms_consent", "email_consent"):
+                if rec[k] is Consent.NO and other[k] != Consent.NO.value:
+                    store.conn.execute(f"UPDATE leads SET {k}='no', updated_at=? WHERE id=?", (now, other["id"]))
+                    store.emit("lead", other["id"], "lead.consent_revoked", {"field": k, "source": source})
         merged_consent = {k: _merge_consent(Consent(cur[k]), rec[k]) for k in ("sms_consent", "email_consent")}
         phone = cur["phone"] or (rec["phone"] if not _taken(store, "phone", rec["phone"], cur["id"]) else None)
         email = cur["email"] or (rec["email"] if not _taken(store, "email", rec["email"], cur["id"]) else None)

@@ -18,9 +18,10 @@ import json
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .timeutil import ts
+from .timeutil import parse_ts, ts
 
 if TYPE_CHECKING:
     from .store import Store
@@ -32,7 +33,14 @@ PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-haiku-5-5": (0.10, 0.50),
     "claude-fable-5-1": (10.00, 50.00),
+    # Models that server-side refusal fallbacks may serve a request on:
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-sonnet-5": (2.00, 10.00),
 }
+# An unrecognized model (a new fallback target, a dated alias) is charged at the highest known rate so
+# the budget errs toward stopping early, never toward recording free calls.
+_UNKNOWN_RATE = max(PRICING.values())
 # Models that accept server-side refusal fallbacks (fallbacks="default").
 _FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"}
 
@@ -50,7 +58,7 @@ class LLMResult:
     def cost_usd(self) -> float:
         if self.cached:
             return 0.0
-        pin, pout = PRICING.get(self.model, (0.0, 0.0))
+        pin, pout = PRICING.get(self.model, _UNKNOWN_RATE)
         return (self.input_tokens * pin + self.output_tokens * pout) / 1_000_000
 
 
@@ -129,8 +137,10 @@ class AnthropicProvider:
 class CachingProvider:
     """Memoize deterministic-purpose calls (classification) in the store."""
 
-    def __init__(self, inner: LLMProvider, store: Store, purposes: frozenset[str] = frozenset({"classify"})) -> None:
+    def __init__(self, inner: LLMProvider, store: Store, purposes: frozenset[str] = frozenset({"classify"}),
+                 ttl_days: int = 30) -> None:
         self.inner = inner
+        self.ttl_days = ttl_days
         self.store = store
         self.purposes = purposes
         self.model = inner.model
@@ -140,12 +150,16 @@ class CachingProvider:
         if purpose not in self.purposes:
             return self.inner.complete_json(purpose=purpose, system=system, user=user, schema=schema,
                                             max_tokens=max_tokens)
-        key = hashlib.sha256(json.dumps([purpose, self.model, system, user, schema], sort_keys=True).encode()).hexdigest()
-        row = self.store.conn.execute("SELECT value FROM llm_cache WHERE key=?", (key,)).fetchone()
-        if row:
+        effort = getattr(self.inner, "effort", None) or getattr(getattr(self.inner, "inner", None), "effort", None)
+        key = hashlib.sha256(json.dumps([purpose, self.model, effort, system, user, schema], sort_keys=True).encode()).hexdigest()
+        row = self.store.conn.execute("SELECT value, created_at FROM llm_cache WHERE key=?", (key,)).fetchone()
+        if row and parse_ts(row["created_at"]) > self.store.now() - timedelta(days=self.ttl_days):
             return LLMResult(json.loads(row["value"]), None, self.model, cached=True)
         res = self.inner.complete_json(purpose=purpose, system=system, user=user, schema=schema, max_tokens=max_tokens)
-        if res.data is not None and res.error is None:
+        # Model output is sampled; only reuse answers the model was sure of and that did not escalate.
+        cacheable = (res.data is not None and res.error is None and res.data.get("confidence") == "high"
+                     and not res.data.get("possible_opt_out"))
+        if cacheable:
             with self.store.tx():
                 self.store.conn.execute("INSERT OR REPLACE INTO llm_cache (key, value, created_at) VALUES (?,?,?)",
                                         (key, json.dumps(res.data), ts(self.store.now())))

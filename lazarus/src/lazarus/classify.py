@@ -591,4 +591,6 @@ def classify(text: str, llm: LLMProvider | None = None, first_name: str | None =
                               confidence="low", injection_suspected=inj)
     if label is Label.UNCLEAR or conf == "low":
         return Classification(label, "llm", needs_review=True, rule_ids=ids, confidence=conf, injection_suspected=inj)
-    return Classification(label, "llm", rule_ids=ids, confidence=conf, injection_suspected=inj)
+    # The same strict gate as rule decisions: opt-out-adjacent wording or an unfamiliar language means a
+    # human confirms before outreach continues, whoever produced the label.
+    return _gate(Classification(label, "llm", rule_ids=ids, confidence=conf, injection_suspected=inj), text, strict)

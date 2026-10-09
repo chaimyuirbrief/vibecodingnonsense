@@ -38,8 +38,10 @@ class FaultPlan:
 class FakeChannel:
     def __init__(self, name: str = "sms", plan: FaultPlan | None = None,
                  clock: Callable[[], datetime] | None = None,
-                 invalid: set[str] | None = None, supports_lookup: bool = True) -> None:
+                 invalid: set[str] | None = None, supports_lookup: bool = True,
+                 latency: Callable[[], object] | None = None) -> None:
         self.name = name
+        self.latency = latency  # called before each send, e.g. to advance a FakeClock (provider latency)
         self.plan = plan or FaultPlan()
         self.clock = clock
         self.invalid = invalid or set()
@@ -60,6 +62,8 @@ class FakeChannel:
         return f"fake_{len(self.deliveries):06d}"
 
     def send(self, msg: Outbound) -> SendResult:
+        if self.latency:
+            self.latency()
         with self._lock:
             self.attempts[msg.idempotency_key] += 1
             if msg.to in self.invalid:

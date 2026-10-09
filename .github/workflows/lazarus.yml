@@ -1,0 +1,35 @@
+name: lazarus
+
+on:
+  push:
+    paths: ["lazarus/**", ".github/workflows/lazarus.yml"]
+  pull_request:
+    paths: ["lazarus/**", ".github/workflows/lazarus.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lazarus
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e '.[dev]'
+      - run: ruff check src tests
+      - run: mypy
+      - run: pytest -o addopts="" -q
+      - name: Simulator invariant gate
+        run: lazarus simulate --leads 300 --days 21 --workers 4 > sim.json || (cat sim.json; exit 1)
+      - name: Classifier safety gate (no unsafe opt-out misses on dev sets)
+        run: |
+          lazarus eval evals/replies_blind_dev.jsonl > /dev/null
+          lazarus eval evals/replies_blind_dev2.jsonl > /dev/null

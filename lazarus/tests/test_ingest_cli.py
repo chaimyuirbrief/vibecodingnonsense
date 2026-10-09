@@ -104,3 +104,26 @@ def test_cli_eval_gate(capsys: pytest.CaptureFixture[str]) -> None:
     assert run("eval", str(ROOT / "evals" / "replies_blind_dev.jsonl")) == 0
     m = json.loads(capsys.readouterr().out)
     assert m["unsafe_opt_out_misses"] == 0
+
+
+def test_labels_export_scrubs_and_feeds_eval(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from lazarus.cli import scrub
+    assert scrub("Dana here, call 404-555-2368 or dana@x.com https://x.co/a", ["Dana"]) == \
+        "<name> here, call <phone> or <email> <url>"
+    db = str(tmp_path / "lab.db")
+    base = ["--db", db, "--now", "2026-10-12T15:00:00Z"]
+    run(*base, "import", str(ROOT / "examples" / "leads.csv"))
+    run(*base, "campaign", "add", str(ROOT / "examples" / "campaign.json"))
+    run(*base, "enroll", "roof-reactivation")
+    capsys.readouterr()
+    run(*base, "inbound", "+14045552368", "who is this? Dana's my wife", "--id", "L1")
+    iid = json.loads(capsys.readouterr().out)["inbound_id"]
+    assert run(*base, "review", "resolve", iid, "wrong_number") == 0
+    out = tmp_path / "labels.jsonl"
+    assert run(*base, "labels", "export", "--out", str(out)) == 0
+    rows = [json.loads(x) for x in out.read_text().splitlines()]
+    assert rows == [{"id": iid, "text": "who is this? <name>'s my wife", "label": "wrong_number", "source": "human",
+                     "received_at": rows[0]["received_at"]}]
+    capsys.readouterr()
+    run("eval", str(out))
+    assert json.loads(capsys.readouterr().out)["n"] == 1

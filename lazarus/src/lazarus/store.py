@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS enrollments (
   state TEXT NOT NULL,
   step_index INTEGER NOT NULL DEFAULT 0,
   next_due_at TEXT,
+  plan_lease_until TEXT,
   outcome TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE (lead_id, campaign_id)
@@ -87,12 +88,14 @@ CREATE TABLE IF NOT EXISTS messages (
   lease_owner TEXT, lease_until TEXT,
   provider_id TEXT, last_error TEXT,
   held_from TEXT,
+  approved_by TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sent_at TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_ready ON messages(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS messages_to ON messages(to_addr, status, sent_at);
 CREATE INDEX IF NOT EXISTS messages_enrollment ON messages(enrollment_id);
-CREATE INDEX IF NOT EXISTS messages_campaign_sent ON messages(campaign_id, status, sent_at);
+CREATE INDEX IF NOT EXISTS messages_campaign_sent ON messages(campaign_id, status, sent_at, kind);
+CREATE INDEX IF NOT EXISTS messages_lead ON messages(lead_id, status);
 
 CREATE TABLE IF NOT EXISTS inbound (
   id TEXT PRIMARY KEY,
@@ -108,6 +111,14 @@ CREATE TABLE IF NOT EXISTS inbound (
   resolved_by TEXT, resolved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS inbound_review ON inbound(needs_review, resolved_at);
+CREATE INDEX IF NOT EXISTS inbound_lead_review ON inbound(lead_id, needs_review, resolved_at);
+
+CREATE TABLE IF NOT EXISTS send_counters (
+  campaign_id TEXT NOT NULL,
+  day TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (campaign_id, day)
+);
 
 CREATE TABLE IF NOT EXISTS suppressions (
   addr TEXT PRIMARY KEY,
@@ -255,11 +266,11 @@ class Store:
 
     def set_message_status(self, message_id: str, status: MessageStatus, *, reason: str,
                            actor: str = "system", expect: frozenset[MessageStatus] | None = None,
-                           **fields: Any) -> bool:
-        """Transition a message. With ``expect``, only if the current status is in it
-        (compare-and-set); returns False when the guard fails."""
+                           owner: str | None = None, **fields: Any) -> bool:
+        """Transition a message. With ``expect``, only if the current status is in it; with ``owner``,
+        only if this worker still holds the lease (compare-and-set). Returns False when a guard fails."""
         allowed = {"attempts", "next_attempt_at", "lease_owner", "lease_until", "provider_id", "last_error",
-                   "sent_at", "body", "subject", "composed_by", "held_from"}
+                   "sent_at", "body", "subject", "composed_by", "held_from", "approved_by"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unexpected message fields {bad}")
@@ -269,6 +280,9 @@ class Store:
         if expect is not None:
             where += f" AND status IN ({','.join('?' * len(expect))})"
             vals += [s.value for s in expect]
+        if owner is not None:
+            where += " AND lease_owner=?"
+            vals.append(owner)
         with self.tx():
             cur = self.conn.execute(f"UPDATE messages SET {', '.join(sets)} WHERE {where}", vals)
             if cur.rowcount != 1:
@@ -320,6 +334,12 @@ class Store:
             if cur.rowcount != 1:
                 raise KeyError(campaign_id)
             self.emit("campaign", campaign_id, f"campaign.{status}", {}, actor)
+
+    def lead_under_review(self, lead_id: str) -> bool:
+        """A lead with any unresolved flagged reply must not be contacted, whatever campaign asks."""
+        return self.conn.execute(
+            "SELECT 1 FROM inbound WHERE lead_id=? AND needs_review=1 AND resolved_at IS NULL LIMIT 1", (lead_id,)
+        ).fetchone() is not None
 
     # ------------------------------------------------------------ suppression
 

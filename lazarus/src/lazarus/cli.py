@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -74,13 +75,13 @@ def build_channels() -> dict[str, Channel]:
     return chans
 
 
-def build_engine(store: Store, with_llm: bool = True) -> Engine:
+def build_engine(store: Store, with_llm: bool = True, llm: LLMProvider | None = None) -> Engine:
     sink = None
     url, secret = env("LAZARUS_WEBHOOK_URL"), env("LAZARUS_WEBHOOK_SECRET")
     if url and secret:
         from .webhooks import WebhookSink
         sink = WebhookSink(url, secret)
-    return Engine(store, build_channels(), llm=build_llm(store) if with_llm else None,
+    return Engine(store, build_channels(), llm=(llm or build_llm(store)) if with_llm else None,
                   worker_id=env("LAZARUS_WORKER_ID", f"pid-{os.getpid()}") or "w", sink=sink)
 
 
@@ -273,6 +274,38 @@ def cmd_export(a: argparse.Namespace) -> int:
     return 0
 
 
+_PHONE_RX = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+_EMAIL_RX = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_URL_RX = re.compile(r"(?i)\bhttps?://\S+")
+
+
+def scrub(text: str, names: list[str]) -> str:
+    """Remove obvious PII before replies leave the database as training/eval data."""
+    out = _URL_RX.sub("<url>", _EMAIL_RX.sub("<email>", _PHONE_RX.sub("<phone>", text)))
+    for n in names:
+        if n and len(n) > 1:
+            out = re.sub(rf"(?i)\b{re.escape(n)}\b", "<name>", out)
+    return out
+
+
+def cmd_labels(a: argparse.Namespace) -> int:
+    """Export human-resolved replies as an eval set (gold labels from your own traffic)."""
+    st = open_store(a)
+    q = """SELECT i.id, i.body, i.label, i.label_source, i.received_at, l.first_name, l.last_name
+           FROM inbound i LEFT JOIN leads l ON l.id=i.lead_id WHERE i.label IS NOT NULL"""
+    if not a.include_auto:
+        q += " AND i.label_source='human'"
+    n = 0
+    with open(a.out, "w", encoding="utf-8") as f:
+        for r in st.conn.execute(q + " ORDER BY i.received_at"):
+            text = r["body"] if a.no_scrub else scrub(r["body"], [r["first_name"] or "", r["last_name"] or ""])
+            f.write(json.dumps({"id": r["id"], "text": text, "label": r["label"], "source": r["label_source"],
+                                "received_at": r["received_at"]}, ensure_ascii=False) + "\n")
+            n += 1
+    out({"exported": n, "file": a.out, "scrubbed": not a.no_scrub, "includes_auto_labels": a.include_auto})
+    return 0
+
+
 def cmd_timeline(a: argparse.Namespace) -> int:
     out(timeline(open_store(a), a.lead))
     return 0
@@ -310,7 +343,8 @@ def cmd_eval(a: argparse.Namespace) -> int:
 def cmd_serve(a: argparse.Namespace) -> int:
     from .server import make_server
     db = a.db
-    srv = make_server(lambda: build_engine(Store(db)), host=a.host, port=a.port,
+    shared_llm = build_llm(Store(db))  # one provider (and one budget) for every request handler
+    srv = make_server(lambda: build_engine(Store(db), llm=shared_llm), host=a.host, port=a.port,
                       public_url=env("LAZARUS_PUBLIC_URL"), twilio_auth_token=env("TWILIO_AUTH_TOKEN"),
                       inbound_secret=env("LAZARUS_INBOUND_SECRET"))
     print(f"listening on http://{a.host}:{a.port}", file=sys.stderr)
@@ -390,6 +424,12 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("export")
     s.add_argument("--state")
     s.set_defaults(fn=cmd_export)
+    s = sub.add_parser("labels", help="export human-resolved replies as a JSONL eval set")
+    s.add_argument("action", choices=["export"])
+    s.add_argument("--out", default="labels.jsonl")
+    s.add_argument("--include-auto", action="store_true", help="also export rule/LLM labels (silver, not gold)")
+    s.add_argument("--no-scrub", action="store_true", help="keep phone numbers, emails, URLs and lead names")
+    s.set_defaults(fn=cmd_labels)
     s = sub.add_parser("timeline")
     s.add_argument("lead")
     s.set_defaults(fn=cmd_timeline)

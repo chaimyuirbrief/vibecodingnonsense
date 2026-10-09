@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -61,6 +61,7 @@ class SimConfig:
     no_consent_rate: float = 0.05
     duplicate_webhook_rate: float = 0.05
     review_delay_hours: float = 4
+    send_latency_s: float = 2.0  # each provider call advances the clock (exposes stale-clock bugs)
     workers: int = 1
     corpus: str = "evals/replies_blind_dev.jsonl"
     fault: FaultPlan = field(default_factory=lambda: FaultPlan(transient=0.05, permanent=0.01, ambiguous=0.01,
@@ -131,7 +132,9 @@ def run(cfg: SimConfig, llm: LLMProvider | None = None, db_path: str | None = No
                             "email_consent": Consent.UNKNOWN, "notes": ""}, source="sim")
         truth_tz[phone] = AREA_TZ[area]
 
-    channel = FakeChannel("sms", plan=cfg.fault, clock=clock.now)
+    latency = (lambda: clock.advance(timedelta(seconds=cfg.send_latency_s))) if cfg.send_latency_s else None
+    fault = cfg.fault if cfg.fault.seed else replace(cfg.fault, seed=cfg.seed)  # faults vary with the run seed
+    channel = FakeChannel("sms", plan=fault, clock=clock.now, latency=latency)
     handoffs: list[dict[str, Any]] = []
     lock = threading.Lock()
 
@@ -199,14 +202,18 @@ def run(cfg: SimConfig, llm: LLMProvider | None = None, db_path: str | None = No
         scheduled = [s for s in scheduled if s[0] > now]
         for _at, phone, text, label in due:
             pid += 1
+            # Stamp the reply with the moment the engine actually receives it. (With provider latency the clock
+            # has moved since the tick began; stamping the tick start made sends that happened before the
+            # engine could know about the reply look like violations.)
+            received = clock.now()
             if label == "opt_out":
-                opted_out_at.setdefault(phone, now)  # when the engine receives it
-            res = engine.handle_inbound("sms", phone, text, provider_id=f"SMsim{pid}", received_at=now)
+                opted_out_at.setdefault(phone, received)
+            res = engine.handle_inbound("sms", phone, text, provider_id=f"SMsim{pid}", received_at=received)
             m[f"reply_true:{label}"] += 1
             m[f"reply_pred:{res['label']}"] += 1
             m["reply_correct"] += res["label"] == label
             if rng.random() < cfg.duplicate_webhook_rate:
-                dup = engine.handle_inbound("sms", phone, text, provider_id=f"SMsim{pid}", received_at=now)
+                dup = engine.handle_inbound("sms", phone, text, provider_id=f"SMsim{pid}", received_at=received)
                 m["duplicate_webhooks"] += 1
                 m["duplicate_webhooks_deduped"] += bool(dup.get("duplicate"))
 
@@ -217,9 +224,10 @@ def run(cfg: SimConfig, llm: LLMProvider | None = None, db_path: str | None = No
                 engine.resolve_review(r["id"], Label(lbl), actor="sim-reviewer")
                 m["reviews_resolved"] += 1
 
-    # Settle: let leases expire and reconcile once more.
-    clock.advance(timedelta(seconds=ecfg.lease_seconds + 1))
+    # Settle: let leases and the resend grace expire, then reconcile until nothing changes.
+    clock.advance(timedelta(seconds=ecfg.lease_seconds + ecfg.resend_grace_s + 1))
     engine.reconcile(clock.now())
+    engine.dispatch(clock.now())
 
     violations = check_invariants(store, channel, campaign, opted_out_at, handoffs)
     sent = store.conn.execute("SELECT status, COUNT(*) n FROM messages GROUP BY status").fetchall()

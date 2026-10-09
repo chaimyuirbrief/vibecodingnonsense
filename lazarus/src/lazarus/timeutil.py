@@ -60,13 +60,37 @@ class FakeClock(Clock):
             self._now = dt.astimezone(UTC)
 
 
-def zone(name: str | None) -> ZoneInfo | None:
+# Abbreviations CRMs export, mapped to DST-aware regions. Other fixed-offset names ("EST5EDT" aside)
+# are rejected: "EST" in zoneinfo is a fixed UTC-5 with no DST, an hour off half the year.
+_ABBREV = {
+    "est": "America/New_York", "edt": "America/New_York", "eastern": "America/New_York", "et": "America/New_York",
+    "cst": "America/Chicago", "cdt": "America/Chicago", "central": "America/Chicago", "ct": "America/Chicago",
+    "mst": "America/Denver", "mdt": "America/Denver", "mountain": "America/Denver", "mt": "America/Denver",
+    "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles", "pacific": "America/Los_Angeles", "pt": "America/Los_Angeles",
+    "akst": "America/Anchorage", "akdt": "America/Anchorage", "alaska": "America/Anchorage",
+    "hst": "Pacific/Honolulu", "hawaii": "Pacific/Honolulu", "ast": "America/Puerto_Rico",
+}
+
+
+def canonical_zone(name: str | None) -> str | None:
     if not name:
         return None
+    n = name.strip()
+    mapped = _ABBREV.get(n.lower())
+    if mapped:
+        return mapped
+    if "/" not in n and n.upper() != "UTC":
+        return None
     try:
-        return ZoneInfo(name)
+        ZoneInfo(n)
     except (ZoneInfoNotFoundError, ValueError):
         return None
+    return n
+
+
+def zone(name: str | None) -> ZoneInfo | None:
+    c = canonical_zone(name)
+    return ZoneInfo(c) if c else None
 
 
 @dataclass(frozen=True)

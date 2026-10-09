@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from email.utils import parseaddr
 from enum import StrEnum
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿­"), None)
@@ -109,7 +110,10 @@ _EMAIL = re.compile(r"^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}
 def normalize_email(raw: object) -> str | None:
     if raw is None:
         return None
-    s = unicodedata.normalize("NFKC", str(raw)).translate(_ZERO_WIDTH).strip().strip("<>").lower()
+    s = unicodedata.normalize("NFKC", str(raw)).translate(_ZERO_WIDTH).strip()
+    if "<" in s and ">" in s:  # "Dana Smith <dana@example.com>"
+        s = parseaddr(s)[1]
+    s = s.strip().strip("<>").lower()
     if s.startswith("mailto:"):
         s = s[7:]
     if len(s) > 254 or not _EMAIL.match(s):
@@ -131,13 +135,12 @@ def normalize_name(raw: object, max_len: int = 40) -> str | None:
     s = re.sub(r"\s+", " ", s)
     if not _NAME_OK.match(s):
         return None
+    if re.search(r"[^\W\d_]\.[^\W\d_]{2,}", s):  # "Pay.Acme-Billing.Com": a host, not a name ("J.R." is fine)
+        return None
     if s.isupper() or s.islower():
-        s = " ".join(_cap(part) for part in s.split(" "))
+        # "MARY-JANE O'BRIEN" -> "Mary-Jane O'Brien", "j.r." -> "J.R."
+        s = re.sub(r"(^|[\s\-'.])([^\W\d_])", lambda m: m.group(1) + m.group(2).upper(), s.lower())
     return s
-
-
-def _cap(word: str) -> str:
-    return "-".join(p[:1].upper() + p[1:].lower() for p in word.split("-"))
 
 
 def split_full_name(raw: object) -> tuple[str | None, str | None]:
@@ -159,3 +162,16 @@ def csv_safe(value: object) -> str:
     if s and s[0] in "=+-@\t\r":
         return "'" + s
     return s
+
+
+def normalize_sender(channel: str, raw: str) -> str:
+    """Best-effort canonical form of an inbound sender, so replies match the stored lead.
+    Falls back to the cleaned raw string (which is still suppressed on opt-out)."""
+    if channel == "sms":
+        p = normalize_phone(raw)
+        if p is None:
+            digits = re.sub(r"[^0-9]", "", unicodedata.normalize("NFKC", raw))
+            if 11 <= len(digits) <= 15 and not digits.startswith("1"):
+                p = normalize_phone("+" + digits)  # international MSISDN delivered without '+'
+        return p or raw.strip()[:320]
+    return normalize_email(raw) or raw.strip().lower()[:320]

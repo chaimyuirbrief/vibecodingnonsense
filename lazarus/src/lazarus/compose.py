@@ -20,9 +20,33 @@ from typing import Any
 from .llm import LLMProvider
 from .models import PLACEHOLDER, Campaign, Lead, Step
 
-URL = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"']+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|co|us|biz|info|ly|me|app|site|xyz|link|gl)\b(?:/[^\s<>\"']*)?")
-NUMBERISH = re.compile(r"(?<![\w.])(?:[$€£]\s?)?\d[\d,]*(?:\.\d+)?\s?(?:%|percent|k\b)?")
+# Any scheme URL, www., or bare host with a 2-24 letter TLD (phones auto-link every TLD, so a short
+# allow-list of TLDs would let "acme-booking.shop/r" or "is.gd/x" through).
+URL = re.compile(r"(?i)\b(?:[a-z][a-z0-9+.-]*://|www\.)[^\s<>\"']+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}\b(?:[/?#\\][^\s<>\"']*)?")
+NUMBERISH = re.compile(r"(?:[$€£]\s?)?\d[\d,]*(?:\.\d+)?\s?(?:%|percent|k\b)?")
+NUMBER_WORDS = re.compile(
+    r"(?i)\b(?:one(?=[\s-]+(?:hundred|thousand|million|year|month|week|day|percent|dollar|free|time offer))|"
+    r"zero|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+    r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+    r"half|quarter|double|triple|twice|percent|dozen)\b")
 SMS_STOP_FOOTER = "Reply STOP to opt out."
+_TYPO = str.maketrans({"\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+                       "\u2026": "...", "\u00a0": " ", "\u2022": "-"})
+GSM7 = set("@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿"
+           "abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€")
+
+
+def gsm_friendly(text: str) -> str:
+    """Typography that silently switches an SMS to UCS-2 (2-3x the segments) replaced with GSM-7 equivalents."""
+    return text.translate(_TYPO)
+
+
+def sms_segments(text: str) -> int:
+    if all(ch in GSM7 for ch in text):
+        n = len(text) + sum(1 for ch in text if ch in "^{}\\[~]|€")  # extension table chars count double
+        return 1 if n <= 160 else -(-n // 153)
+    n = len(text.encode("utf-16-le")) // 2
+    return 1 if n <= 70 else -(-n // 67)
 
 
 @dataclass
@@ -52,16 +76,23 @@ def render(template: str, lead: Lead, campaign: Campaign) -> str:
 
 
 def _domain(url: str) -> str:
-    u = re.sub(r"(?i)^https?://", "", url)
-    u = re.sub(r"(?i)^www\.", "", u)
-    return u.split("/")[0].split("?")[0].split(":")[0].lower().rstrip(".")
+    """Host as a browser would resolve it: stop at any of / ? # \\, drop userinfo and port."""
+    u = re.sub(r"(?i)^[a-z][a-z0-9+.-]*://", "", url)
+    u = re.split(r"[/?#\\]", u, maxsplit=1)[0]
+    u = u.rsplit("@", 1)[-1].split(":")[0]
+    return re.sub(r"(?i)^www\.", "", u).lower().rstrip(".")
+
+
+def _norm_phrase(text: str) -> str:
+    return re.sub(r"[\s\-]+", " ", gsm_friendly(text).casefold())
 
 
 def _norm_num(tok: str) -> str:
     return re.sub(r"[\s,$€£]|percent", "", tok.lower()).replace("%", "")
 
 
-def guard(body: str, campaign: Campaign, lead: Lead, step: Step, reference: str, is_first: bool) -> list[str]:
+def guard(body: str, campaign: Campaign, lead: Lead, step: Step, reference: str, is_first: bool,
+          check_greeting: bool = True) -> list[str]:
     """Return a list of violations (empty = acceptable)."""
     v: list[str] = []
     if not body.strip():
@@ -69,6 +100,10 @@ def guard(body: str, campaign: Campaign, lead: Lead, step: Step, reference: str,
     limit = campaign.max_sms_chars - (len(SMS_STOP_FOOTER) + 1) if step.channel == "sms" else 5000
     if len(body) > limit:
         v.append(f"too_long:{len(body)}>{limit}")
+    if step.channel == "sms":
+        max_segments = sms_segments("x" * campaign.max_sms_chars)
+        if sms_segments(f"{body} {SMS_STOP_FOOTER}") > max_segments:
+            v.append("too_many_segments")
     if "{" in body or "}" in body:
         v.append("unrendered_braces")
     allowed = set(campaign.allowed_link_domains)
@@ -82,13 +117,19 @@ def guard(body: str, campaign: Campaign, lead: Lead, step: Step, reference: str,
         n = _norm_num(tok)
         if n and n not in known:
             v.append(f"unsupported_number:{tok.strip()}")
-    low = body.lower()
+    known_words = {w.lower() for w in NUMBER_WORDS.findall(known_text)}
+    for w in NUMBER_WORDS.findall(body):
+        if w.lower() not in known_words:
+            v.append(f"unsupported_number_word:{w}")
+    low = _norm_phrase(body)
+    ref_low = _norm_phrase(reference)
     for phrase in campaign.forbidden_phrases:
-        if phrase.lower() in low and phrase.lower() not in reference.lower():
+        p = _norm_phrase(phrase)
+        if p in low and p not in ref_low:
             v.append(f"forbidden_phrase:{phrase}")
-    if is_first and campaign.business_name.lower() not in low:
+    if is_first and campaign.business_name.lower() not in body.lower():
         v.append("missing_business_identification")
-    greet = re.match(r"(?i)(?:hi|hey|hello|dear|good (?:morning|afternoon|evening))[,\s]+([^\W\d_]+)", body.strip())
+    greet = None if not check_greeting else re.match(r"(?i)(?:hi|hey|hello|dear|good (?:morning|afternoon|evening))[,\s]+([^\W\d_]+)", body.strip())
     if greet:
         name = greet.group(1).lower()
         ok = {"there", "again", "all", "folks", "friend", "neighbor", "it's", "its", "this"}
@@ -116,8 +157,21 @@ Hard rules:
 Return JSON {"body": "..."}."""
 
 
+class TemplateRejected(ValueError):
+    """The rendered template itself fails the guard even without lead data: operator must fix the campaign."""
+
+
 def compose(step: Step, lead: Lead, campaign: Campaign, *, is_first: bool, llm: LLMProvider | None) -> Composed:
     draft = render(step.template, lead, campaign)
+    # Lead data is untrusted: a "name" that slipped through import validation must not add a link or a
+    # number to an outbound text. If it does, render without lead fields instead.
+    template_ref = " ".join([step.template, campaign.business_name, campaign.sender_name])
+    if guard(draft, campaign, lead.model_copy(update={"first_name": None, "last_name": None}), step,
+             reference=template_ref, is_first=is_first, check_greeting=False):
+        draft = render(step.template, lead.model_copy(update={"first_name": None, "last_name": None}), campaign)
+        bad = guard(draft, campaign, lead, step, reference=template_ref, is_first=is_first, check_greeting=False)
+        if bad:
+            raise TemplateRejected(f"step template fails the output guard: {bad}")
     subject = render(step.subject, lead, campaign) if step.subject else None
     result = Composed(draft, subject, "template")
 
@@ -132,7 +186,7 @@ def compose(step: Step, lead: Lead, campaign: Campaign, *, is_first: bool, llm: 
                                 max_tokens=1024)
         body = (res.data or {}).get("body") if res.data else None
         if isinstance(body, str):
-            body = re.sub(r"\s+\n", "\n", body).strip()
+            body = re.sub(r"\s+\n", "\n", gsm_friendly(body)).strip()
             violations = guard(body, campaign, lead, step, reference=draft, is_first=is_first)
             if not violations:
                 result = Composed(body, subject, "llm")

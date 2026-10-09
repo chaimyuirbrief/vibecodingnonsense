@@ -40,3 +40,30 @@ drops from 0.99 to 0.83 on unseen phrasing, and 5 held-out `interested` replies 
 (they would be suppressed — lost revenue, not a compliance risk). Hand-written rules plateau; the
 long tail needs the LLM layer or a human. Response: generate a second, broader blind set (dev2 for
 inspection, test2 never inspected) rather than looking at blind_test errors.
+
+### Classifier v2 + strict gates (tuned on blind_dev2; test sets frozen afterwards)
+- v1 on the fresh blind_dev2 set: accuracy 0.483, 2 unsafe misses — round-2 data (multilingual, hard negatives,
+  adversarial) exposed how narrow the v1 rules were.
+- v2: quoted-text stripping, negation neutralizing ("don't stop texting"), narrower legal/remove rules,
+  injection-sentence stripping (remainder classified; any opt-out signal in the full text -> human),
+  multilingual tables (accent-stripped and raw views; fixed an NFD bug that split Hangul into jamo).
+- Strict gates: decisive non-opt-out labels only without opt-out-adjacent vocabulary and in English/Spanish.
+- Final (rules only): blind_test 0.797 acc, 33/33 opt-outs stopped, 0 unsafe; blind_test2 0.634 acc,
+  48/50 stopped, 2 unsafe, 39% review. See docs/EVALUATION.md (incl. aggregate-leakage disclosure).
+
+### Tests and bugs found by them
+- 226 tests at first green run. Bugs the tests caught before any review: Unicode-digit phones produced
+  non-ASCII "E.164" (Hypothesis), RFC-invalid Message-ID from ':' in idempotency keys, held messages released
+  straight to `queued` bypassing approval (a sloppy `A and B or C` assertion had hidden it), and a snoozed
+  step whose canceled message blocked re-planning (idempotency key collision; fixed with key generations).
+- Simulator mutation tests: 5/5 deliberately broken guarantees detected (policy off, opt-out ignored, blind
+  resend, unlogged state change, consent ignored).
+
+### Phase 5 performance loop
+See docs/BENCHMARKS.md. Baseline dispatch degraded 1,574 -> 324 msg/s from 1k -> 10k leads. Three profiled
+hypotheses, each kept: daily cap moved to an exact counter in the claim transaction (5.8x dispatch),
+`messages(lead_id, status)` index (2.2x inbound), chunked import transactions (2.8x import).
+
+### Phase 7 adversarial review (5 lenses, every finding reproduced or refuted by a separate verifier)
+Developed fixes in an isolated copy while verification ran against the unchanged code, then ported.
+Details and verdicts: docs/RED_TEAM.md.

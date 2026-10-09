@@ -1,0 +1,25 @@
+{
+  "round1": {
+    "counts": {
+      "generated": 320,
+      "agreed": 320,
+      "disputed": 0
+    },
+    "tiebroken": 0,
+    "dropped": 0,
+    "unique_kept": 306,
+    "split_seed": 20261009
+  },
+  "round2": {
+    "counts": {
+      "generated": 360,
+      "agreed": 359,
+      "disputed": 1
+    },
+    "tiebroken": 1,
+    "dropped": 0,
+    "unique_kept": 349,
+    "overlap_removed": 11,
+    "split_seed": 20261010
+  }
+}

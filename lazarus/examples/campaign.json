@@ -1,0 +1,20 @@
+{
+  "id": "roof-reactivation",
+  "name": "Roof leads 2023-2024 reactivation",
+  "business_name": "Brightside Roofing",
+  "sender_name": "Mike",
+  "business_timezone": "America/New_York",
+  "facts": [
+    "Free roof inspection, no cost.",
+    "We install asphalt shingle and standing-seam metal roofs.",
+    "Financing is available on approved credit."
+  ],
+  "allowed_link_domains": ["brightsideroofing.example"],
+  "steps": [
+    {"channel": "sms", "delay_hours": 0, "template": "Hi {first_name|there}, it's {sender_name} from {business_name}. Are you still looking to get your roof replaced?", "goal": "Ask if they are still interested."},
+    {"channel": "sms", "delay_hours": 72, "template": "Hi {first_name|there}, {sender_name} again. Happy to do a free inspection if the roof is still on your list. Want me to find a time?", "personalize": true, "goal": "Offer the free inspection."},
+    {"channel": "sms", "delay_hours": 168, "template": "Last note from me, {first_name|there}. If the roof ever comes back up, just reply here and I'll take care of you.", "goal": "Polite close-out."}
+  ],
+  "approve_first_n": 5,
+  "approve_llm_messages": true
+}

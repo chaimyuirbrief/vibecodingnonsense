@@ -1,0 +1,42 @@
+{
+  "blind_dev": {
+    "accuracy": 0.993,
+    "macro_f1": 0.992,
+    "review_rate": 0.124,
+    "opt_out_stopped": "40/40",
+    "unsafe": 0,
+    "decisive": 134,
+    "decisive_precision": 1.0,
+    "false_opt_outs": 0
+  },
+  "blind_dev2": {
+    "accuracy": 0.966,
+    "macro_f1": 0.957,
+    "review_rate": 0.259,
+    "opt_out_stopped": "37/37",
+    "unsafe": 0,
+    "decisive": 129,
+    "decisive_precision": 0.977,
+    "false_opt_outs": 0
+  },
+  "blind_test": {
+    "accuracy": 0.797,
+    "macro_f1": 0.814,
+    "review_rate": 0.248,
+    "opt_out_stopped": "33/33",
+    "unsafe": 0,
+    "decisive": 115,
+    "decisive_precision": 0.87,
+    "false_opt_outs": 5
+  },
+  "blind_test2": {
+    "accuracy": 0.634,
+    "macro_f1": 0.664,
+    "review_rate": 0.394,
+    "opt_out_stopped": "48/50",
+    "unsafe": 2,
+    "decisive": 106,
+    "decisive_precision": 0.849,
+    "false_opt_outs": 3
+  }
+}
